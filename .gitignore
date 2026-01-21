@@ -1,0 +1,48 @@
+# ROS2 Build Artifacts
+mary_ws/build/
+mary_ws/install/
+mary_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# YOLO models (download separately)
+models/*.pt
+models/*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS bags (large files)
+*.bag
+*.db3
+rosbag*/
+
+# Logs
+*.log
+log/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment
+.env
+venv/

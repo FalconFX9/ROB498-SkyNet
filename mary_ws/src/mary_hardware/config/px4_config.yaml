@@ -1,0 +1,95 @@
+# PX4 Configuration for MARY Drone (Cube Orange+)
+# Optimized for person-following umbrella drone
+
+/**:
+  ros__parameters:
+    startup_px4_usb_quirk: false
+
+# System status
+/**/sys:
+  ros__parameters:
+    min_voltage: [14.8]  # 4S LiPo minimum voltage
+    disable_diag: false
+    heartbeat_rate: 1.0
+    conn_timeout: 10.0
+
+# Time synchronization
+/**/time:
+  ros__parameters:
+    time_ref_source: "fcu"
+    timesync_mode: MAVLINK
+    timesync_avg_alpha: 0.6
+    timesync_rate: 10.0
+    system_time_rate: 1.0
+
+# Command settings
+/**/cmd:
+  ros__parameters:
+    use_comp_id_system_control: false
+
+# Global position
+/**/global_position:
+  ros__parameters:
+    frame_id: "map"
+    child_frame_id: "base_link"
+    rot_covariance: 99999.0
+    use_relative_alt: true
+    tf.send: false
+
+# IMU settings
+/**/imu:
+  ros__parameters:
+    frame_id: "base_link"
+    linear_acceleration_stdev: 0.0003
+    angular_velocity_stdev: 0.0003490659
+    orientation_stdev: 1.0
+    magnetic_stdev: 0.0
+
+# Local position
+/**/local_position:
+  ros__parameters:
+    frame_id: "map"
+    tf.send: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "base_link"
+    tf.send_fcu: false
+
+# Setpoint position
+/**/setpoint_position:
+  ros__parameters:
+    tf.listen: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "target_position"
+    tf.rate_limit: 50.0
+    mav_frame: LOCAL_NED
+
+# Setpoint velocity
+/**/setpoint_velocity:
+  ros__parameters:
+    mav_frame: LOCAL_NED
+
+# Vision pose estimate (T265 -> PX4)
+/**/vision_pose:
+  ros__parameters:
+    tf.listen: false
+    tf.frame_id: "odom"
+    tf.child_frame_id: "vision_estimate"
+    tf.rate_limit: 10.0
+
+# Distance sensor (TeraRanger Evo 60m)
+/**/distance_sensor:
+  ros__parameters:
+    config: |
+      teraranger_evo:
+        id: 0
+        frame_id: "tof_frame"
+        orientation: PITCH_270  # Downward-facing
+        field_of_view: 0.035    # 2 degrees in radians
+        send_tf: true
+        sensor_position: {x: 0.0, y: 0.0, z: -0.05}
+
+# Odometry
+/**/odometry:
+  ros__parameters:
+    fcu.odom_parent_id_des: "map"
+    fcu.odom_child_id_des: "base_link"

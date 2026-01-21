@@ -1,0 +1,33 @@
+# MAVROS Plugin Configuration for MARY Drone
+
+/**:
+  ros__parameters:
+    plugin_allowlist:
+      - 'sys_*'
+      - 'param'
+      - 'imu'
+      - 'gps'
+      - 'local_position'
+      - 'global_position'
+      - 'setpoint_*'
+      - 'command'
+      - 'ftp'
+      - 'rc_io'
+      - 'distance_sensor'
+      - 'vision_pose'
+      - 'vision_speed'
+      - 'odometry'
+      - 'altitude'
+
+    plugin_denylist:
+      - 'actuator_control'
+      - 'hil'
+      - 'safety_area'
+      - 'debug_value'
+      - 'vibration'
+      - 'home_position'
+      - 'waypoint'
+      - 'geofence'
+      - 'rally'
+      - 'log_transfer'
+      - 'onboard_computer_status'

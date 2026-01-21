@@ -1,0 +1,11 @@
+# SwitchPerson.srv
+# Switch to tracking a different person
+
+# Request
+int32 target_id            # -1 = acquire nearest person, >0 = specific ID
+bool require_confirmation  # Wait for person to confirm (wave, etc.)
+---
+# Response
+bool success
+int32 new_target_id
+string message
