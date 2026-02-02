@@ -1,6 +1,6 @@
 # MARY - Mobile Autonomous Rain sYstem
 
-[![ROS2](https://img.shields.io/badge/ROS2-Humble-blue)](https://docs.ros.org/en/humble/)
+[![ROS2](https://img.shields.io/badge/ROS2-Foxy-blue)](https://docs.ros.org/en/foxy/)
 [![PX4](https://img.shields.io/badge/PX4-Autopilot-orange)](https://px4.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -146,12 +146,12 @@ ROB498-SkyNet/
 
 ### Prerequisites
 
-- Ubuntu 22.04
-- ROS2 Humble
-- Python 3.10+
+- Ubuntu 20.04
+- ROS2 Foxy
+- Python 3.8+
 - CUDA (for Jetson Nano GPU acceleration)
 
-### 1. Install ROS2 Humble
+### 1. Install ROS2 Foxy
 
 ```bash
 # Add ROS2 repository
@@ -162,18 +162,18 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-a
 
 # Install ROS2
 sudo apt update
-sudo apt install ros-humble-desktop ros-dev-tools
+sudo apt install ros-foxy-desktop ros-dev-tools
 ```
 
 ### 2. Install Dependencies
 
 ```bash
 # MAVROS
-sudo apt install ros-humble-mavros ros-humble-mavros-extras
-sudo /opt/ros/humble/lib/mavros/install_geographiclib_datasets.sh
+sudo apt install ros-foxy-mavros ros-foxy-mavros-extras
+sudo /opt/ros/foxy/lib/mavros/install_geographiclib_datasets.sh
 
 # RealSense
-sudo apt install ros-humble-realsense2-camera
+sudo apt install ros-foxy-realsense2-camera
 
 # OpenCV and vision
 sudo apt install python3-opencv
@@ -181,8 +181,11 @@ sudo apt install python3-opencv
 # YOLO (Ultralytics)
 pip3 install ultralytics
 
+# TF transformations (required for T265 pose processing)
+pip3 install tf_transformations transforms3d
+
 # Other Python dependencies
-pip3 install numpy scipy transforms3d
+pip3 install numpy scipy
 ```
 
 ### 3. Build the Workspace
@@ -194,7 +197,7 @@ git clone https://github.com/YOUR_USERNAME/ROB498-SkyNet.git
 cd ROB498-SkyNet
 
 # Source ROS2
-source /opt/ros/humble/setup.bash
+source /opt/ros/foxy/setup.bash
 
 # Build
 cd mary_ws

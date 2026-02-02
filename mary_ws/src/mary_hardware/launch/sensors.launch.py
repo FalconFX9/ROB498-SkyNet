@@ -16,7 +16,7 @@ def generate_launch_description():
     return LaunchDescription([
         # ========== Intel RealSense T265 ==========
         # Note: Requires realsense2_camera package
-        # Install: sudo apt install ros-humble-realsense2-camera
+        # Install: sudo apt install ros-foxy-realsense2-camera
 
         DeclareLaunchArgument(
             name='enable_t265',
