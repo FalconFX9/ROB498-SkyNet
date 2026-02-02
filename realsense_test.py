@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 
 # --- Start T265 pipeline ---
+print("1")
 pipeline = rs.pipeline()
 config = rs.config()
 config.enable_stream(rs.stream.fisheye, 1)  # left
@@ -10,6 +11,8 @@ config.enable_stream(rs.stream.fisheye, 2)  # right
 profile = pipeline.start(config)
 
 # --- Stereo SGBM parameters ---
+print("2")
+
 window_size = 5
 min_disp = 0
 num_disp = 64  # must be divisible by 16
@@ -26,6 +29,8 @@ stereo = cv2.StereoSGBM_create(
     preFilterCap=63,
     mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
 )
+
+print("3")
 
 try:
     while True:
