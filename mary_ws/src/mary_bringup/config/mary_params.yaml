@@ -1,0 +1,81 @@
+# MARY Drone Parameters
+# Central configuration file for all nodes
+
+# ========== Perception Parameters ==========
+person_tracker_node:
+  ros__parameters:
+    model_path: "yolov8n.pt"
+    confidence_threshold: 0.5
+    target_class: "person"
+    image_width: 640
+    image_height: 480
+    camera_fov_h: 62.2  # IMX219 horizontal FOV
+    camera_fov_v: 48.8  # IMX219 vertical FOV
+    publish_debug_image: true
+
+tof_processor_node:
+  ros__parameters:
+    filter_window_size: 5
+    outlier_threshold: 0.5
+    target_altitude: 2.5
+    altitude_deadband: 0.1
+    publish_rate: 20.0
+
+t265_pose_node:
+  ros__parameters:
+    publish_rate: 30.0
+    publish_tf: true
+    world_frame_id: "map"
+    drone_frame_id: "base_link"
+    # Camera offset from drone center (meters)
+    camera_position_x: 0.0
+    camera_position_y: 0.0
+    camera_position_z: 0.05
+
+# ========== Control Parameters ==========
+follower_node:
+  ros__parameters:
+    target_altitude: 2.5       # meters above person
+    follow_distance: 0.0       # horizontal offset (0 = directly above)
+    max_horizontal_speed: 2.0  # m/s
+    max_vertical_speed: 1.0    # m/s
+    position_p_gain: 1.0
+    velocity_ff_gain: 0.8      # feedforward gain
+    detection_timeout: 2.0     # seconds
+    control_rate: 20.0         # Hz
+
+altitude_controller_node:
+  ros__parameters:
+    kp: 1.5
+    ki: 0.1
+    kd: 0.5
+    max_integral: 2.0
+    max_output: 1.5
+    deadband: 0.05
+    min_altitude: 1.0
+    max_altitude: 5.0
+    default_setpoint: 2.5
+    control_rate: 50.0
+
+mission_manager_node:
+  ros__parameters:
+    takeoff_altitude: 2.5
+    arming_timeout: 10.0
+    takeoff_timeout: 30.0
+    acquire_timeout: 60.0
+
+comm_node:
+  ros__parameters:
+    setpoint_rate: 20.0
+    vision_pose_rate: 30.0
+
+# ========== Safety Limits ==========
+safety:
+  ros__parameters:
+    min_altitude: 1.0          # Never go below this (meters)
+    max_altitude: 5.0          # Never go above this (meters)
+    max_horizontal_speed: 3.0  # Emergency limit (m/s)
+    max_vertical_speed: 2.0    # Emergency limit (m/s)
+    geofence_radius: 20.0      # Maximum distance from start (meters)
+    low_battery_voltage: 14.0  # Warning threshold (4S LiPo)
+    critical_battery_voltage: 13.2  # Land immediately

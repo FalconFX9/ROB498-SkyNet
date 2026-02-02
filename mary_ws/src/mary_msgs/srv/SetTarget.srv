@@ -1,0 +1,10 @@
+# SetTarget.srv
+# Set target altitude or following parameters
+
+# Request
+float32 target_altitude    # Target altitude above person (meters)
+float32 max_speed          # Maximum following speed (m/s)
+---
+# Response
+bool success
+string message
