@@ -55,7 +55,7 @@ def generate_launch_description():
         # T265 Pose processing
         Node(
             package='mary_perception',
-            executable='t265_pose_node.py',
+            executable='t265_pose_node',
             name='t265_pose_node',
             output='screen',
             parameters=[{
@@ -67,7 +67,7 @@ def generate_launch_description():
         # Person tracking
         Node(
             package='mary_perception',
-            executable='person_tracker_node.py',
+            executable='person_tracker_node',
             name='person_tracker_node',
             output='screen',
             parameters=[{
@@ -80,7 +80,7 @@ def generate_launch_description():
         # ToF processing
         Node(
             package='mary_perception',
-            executable='tof_processor_node.py',
+            executable='tof_processor_node',
             name='tof_processor_node',
             output='screen',
             parameters=[{
@@ -94,7 +94,7 @@ def generate_launch_description():
         # Communication node
         Node(
             package='mary_control',
-            executable='comm_node.py',
+            executable='comm_node',
             name='comm_node',
             output='screen',
             parameters=[{
@@ -106,7 +106,7 @@ def generate_launch_description():
         # Altitude controller
         Node(
             package='mary_control',
-            executable='altitude_controller_node.py',
+            executable='altitude_controller_node',
             name='altitude_controller_node',
             output='screen',
             parameters=[{
@@ -120,7 +120,7 @@ def generate_launch_description():
         # Person follower
         Node(
             package='mary_control',
-            executable='follower_node.py',
+            executable='follower_node',
             name='follower_node',
             output='screen',
             parameters=[{
@@ -134,7 +134,7 @@ def generate_launch_description():
         # Mission manager
         Node(
             package='mary_control',
-            executable='mission_manager_node.py',
+            executable='mission_manager_node',
             name='mission_manager_node',
             output='screen',
             parameters=[{
