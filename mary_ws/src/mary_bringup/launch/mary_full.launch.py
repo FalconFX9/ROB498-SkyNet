@@ -85,6 +85,8 @@ def generate_launch_description():
             name='comm_node',
             output='screen',
             parameters=[{
+                'drone_id': 'rob498_drone_07',
+                'takeoff_altitude': 1.5,
                 'setpoint_rate': 20.0,
                 'vision_pose_rate': 30.0,
             }],

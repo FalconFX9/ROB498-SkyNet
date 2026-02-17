@@ -58,6 +58,8 @@ mission_manager_node:
 
 comm_node:
   ros__parameters:
+    drone_id: 'rob498_drone_10'   # Change to match your team number
+    takeoff_altitude: 1.5         # meters — 1.5 m for Exercise #2
     setpoint_rate: 20.0
     vision_pose_rate: 30.0
 
