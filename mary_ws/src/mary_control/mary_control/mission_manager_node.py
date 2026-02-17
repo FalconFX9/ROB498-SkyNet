@@ -13,7 +13,7 @@ High-level state machine for mission control:
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
-from std_msgs.msg import String, Bool, Float32
+from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger, SetBool
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State
@@ -80,12 +80,6 @@ class MissionManagerNode(Node):
         )
 
         # Other subscribers
-        self.altitude_sub = self.create_subscription(
-            Float32,
-            '/mary/perception/altitude',
-            self.altitude_callback,
-            10
-        )
         self.detected_sub = self.create_subscription(
             Bool,
             '/mary/perception/person_detected',
@@ -131,17 +125,14 @@ class MissionManagerNode(Node):
         """Update MAVROS state."""
         self.mavros_state = msg
 
-    def altitude_callback(self, msg: Float32):
-        """Update current altitude."""
-        self.current_altitude = msg.data
-
     def person_detected_callback(self, msg: Bool):
         """Update person detection status."""
         self.person_detected = msg.data
 
     def pose_callback(self, msg: PoseStamped):
-        """Update drone pose."""
+        """Update drone pose and extract altitude from T265."""
         self.drone_pose = msg
+        self.current_altitude = msg.pose.position.z
 
     def transition_to(self, new_state: MissionState):
         """Transition to a new state."""

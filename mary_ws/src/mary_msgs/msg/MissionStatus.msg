@@ -25,7 +25,6 @@ bool localization_valid
 
 # Sensor health
 bool t265_ok
-bool tof_ok
 bool camera_ok
 
 # Current values

@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
 from geometry_msgs.msg import PoseStamped, PointStamped, TwistStamped, Vector3Stamped
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool
 from nav_msgs.msg import Odometry
 import numpy as np
 
@@ -22,8 +22,7 @@ class FollowerNode(Node):
         /mary/perception/person_position (geometry_msgs/PointStamped): Person position in camera frame
         /mary/perception/person_velocity (geometry_msgs/Vector3Stamped): Person velocity estimate
         /mary/perception/person_detected (std_msgs/Bool): Detection status
-        /mary/localization/pose (geometry_msgs/PoseStamped): Current drone pose
-        /mary/perception/altitude (std_msgs/Float32): Current altitude above person
+        /mary/localization/pose (geometry_msgs/PoseStamped): Current drone pose (altitude via pose.position.z)
 
     Publications:
         /mavros/setpoint_velocity/cmd_vel (geometry_msgs/TwistStamped): Velocity commands
@@ -65,7 +64,7 @@ class FollowerNode(Node):
         self.person_position = None      # In camera/world frame
         self.person_velocity = None      # Estimated velocity
         self.drone_pose = None           # Current drone pose
-        self.current_altitude = None     # ToF altitude
+        self.current_altitude = None     # T265 altitude (pose.position.z)
 
         # Subscribers
         self.person_pos_sub = self.create_subscription(
@@ -92,13 +91,6 @@ class FollowerNode(Node):
             self.pose_callback,
             qos_profile_system_default
         )
-        self.altitude_sub = self.create_subscription(
-            Float32,
-            '/mary/perception/altitude',
-            self.altitude_callback,
-            10
-        )
-
         # Publishers
         self.vel_pub = self.create_publisher(
             TwistStamped,
@@ -133,12 +125,9 @@ class FollowerNode(Node):
             self.last_detection_time = self.get_clock().now()
 
     def pose_callback(self, msg: PoseStamped):
-        """Update current drone pose."""
+        """Update current drone pose and extract altitude from T265."""
         self.drone_pose = msg
-
-    def altitude_callback(self, msg: Float32):
-        """Update current altitude from ToF."""
-        self.current_altitude = msg.data
+        self.current_altitude = msg.pose.position.z
 
     def control_loop(self):
         """Main control loop - runs at control_rate Hz."""

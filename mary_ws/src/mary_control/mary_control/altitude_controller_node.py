@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
 Altitude Controller Node for MARY Drone
-PID controller for maintaining altitude above person using ToF sensor.
+PID controller for maintaining altitude above person using T265 pose.
 """
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32
+from geometry_msgs.msg import PoseStamped
 import numpy as np
 from collections import deque
 
 
 class AltitudeControllerNode(Node):
     """
-    PID altitude controller using ToF sensor feedback.
+    PID altitude controller using T265 pose feedback.
 
     Subscriptions:
-        /mary/perception/altitude (std_msgs/Float32): Current altitude
+        /mary/localization/pose (geometry_msgs/PoseStamped): Current drone pose from T265
         /mary/control/altitude_setpoint (std_msgs/Float32): Target altitude
 
     Publications:
@@ -62,10 +63,10 @@ class AltitudeControllerNode(Node):
         self.derivative_history = deque(maxlen=5)
 
         # Subscribers
-        self.altitude_sub = self.create_subscription(
-            Float32,
-            '/mary/perception/altitude',
-            self.altitude_callback,
+        self.pose_sub = self.create_subscription(
+            PoseStamped,
+            '/mary/localization/pose',
+            self.pose_callback,
             10
         )
         self.setpoint_sub = self.create_subscription(
@@ -95,9 +96,9 @@ class AltitudeControllerNode(Node):
         self.get_logger().info(f'  PID gains: Kp={self.kp}, Ki={self.ki}, Kd={self.kd}')
         self.get_logger().info(f'  Altitude limits: [{self.min_altitude}, {self.max_altitude}]m')
 
-    def altitude_callback(self, msg: Float32):
-        """Update current altitude measurement."""
-        self.current_altitude = msg.data
+    def pose_callback(self, msg: PoseStamped):
+        """Update current altitude from T265 pose."""
+        self.current_altitude = msg.pose.position.z
 
     def setpoint_callback(self, msg: Float32):
         """Update altitude setpoint with safety limits."""

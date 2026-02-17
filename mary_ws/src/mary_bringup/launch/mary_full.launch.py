@@ -4,10 +4,10 @@ Launches all nodes for complete autonomous operation
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node, PushRosNamespace
+from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -15,7 +15,6 @@ import os
 def generate_launch_description():
     # Package directories
     hardware_pkg = get_package_share_directory('mary_hardware')
-    bringup_pkg = get_package_share_directory('mary_bringup')
 
     return LaunchDescription([
         # ========== Arguments ==========
@@ -43,7 +42,7 @@ def generate_launch_description():
             }.items(),
         ),
 
-        # Sensors (T265, IMX219, ToF)
+        # Sensors (T265, IMX219)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(hardware_pkg, 'launch', 'sensors.launch.py')
@@ -74,18 +73,6 @@ def generate_launch_description():
                 'model_path': 'yolov8n.pt',
                 'confidence_threshold': 0.5,
                 'publish_debug_image': True,
-            }],
-        ),
-
-        # ToF processing
-        Node(
-            package='mary_perception',
-            executable='tof_processor_node',
-            name='tof_processor_node',
-            output='screen',
-            parameters=[{
-                'filter_window_size': 5,
-                'target_altitude': 2.5,
             }],
         ),
 

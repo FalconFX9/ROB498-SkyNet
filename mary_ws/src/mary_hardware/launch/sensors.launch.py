@@ -49,22 +49,26 @@ def generate_launch_description():
             ],
         ),
 
-        # ========== Sony IMX219 Camera (via GStreamer) ==========
+        # ========== Sony IMX219-160 Camera ==========
+        # Jetson CSI-2 camera using nvarguscamerasrc (hardware ISP, recommended)
+        # Requires: sudo apt install ros-foxy-gscam2
+        # Verify hardware: gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! xvimagesink
+
         DeclareLaunchArgument(
             name='enable_imx219',
             default_value='true',
-            description='Enable IMX219 camera'
+            description='Enable IMX219-160 CSI camera'
         ),
 
         DeclareLaunchArgument(
             name='camera_width',
-            default_value='640',
+            default_value='1280',
             description='Camera capture width'
         ),
 
         DeclareLaunchArgument(
             name='camera_height',
-            default_value='480',
+            default_value='720',
             description='Camera capture height'
         ),
 
@@ -74,18 +78,25 @@ def generate_launch_description():
             description='Camera frame rate'
         ),
 
-        # IMX219 camera node using v4l2_camera or gscam
-        # Note: On Jetson, use gscam with nvarguscamerasrc for better performance
+        # IMX219 via gscam2 with Jetson hardware ISP (nvarguscamerasrc)
+        # sensor-id=0 for CAM0 port, sensor-id=1 for CAM1 port
         Node(
-            package='v4l2_camera',
-            executable='v4l2_camera_node',
+            package='gscam2',
+            executable='gscam_main',
             name='imx219_camera',
             namespace='mary',
             parameters=[{
-                'video_device': '/dev/video0',
-                'image_size': [640, 480],
-                'pixel_format': 'YUYV',
-                'camera_frame_id': 'camera_link',
+                'gscam_config': (
+                    'nvarguscamerasrc sensor-id=0 ! '
+                    'video/x-raw(memory:NVMM), width=1280, height=720, '
+                    'format=NV12, framerate=30/1 ! '
+                    'nvvidconv ! video/x-raw, format=BGRx ! '
+                    'videoconvert ! video/x-raw, format=BGR'
+                ),
+                'camera_name': 'imx219',
+                'camera_info_url': '',  # Optional: path to calibration yaml
+                'frame_id': 'camera_link',
+                'sync_sink': True,
             }],
             output='screen',
             remappings=[
@@ -94,36 +105,4 @@ def generate_launch_description():
             ],
         ),
 
-        # ========== TeraRanger Evo 60m ToF ==========
-        # Note: TeraRanger publishes via serial/I2C
-        # This is a placeholder - actual driver depends on interface
-
-        DeclareLaunchArgument(
-            name='enable_tof',
-            default_value='true',
-            description='Enable ToF sensor'
-        ),
-
-        DeclareLaunchArgument(
-            name='tof_port',
-            default_value='/dev/ttyUSB1',
-            description='ToF sensor serial port'
-        ),
-
-        # TeraRanger Evo driver node
-        # Note: Install teraranger_array ROS2 package or use custom driver
-        # Node(
-        #     package='teraranger_array',
-        #     executable='teraranger_evo',
-        #     name='teraranger_evo',
-        #     namespace='mary',
-        #     parameters=[{
-        #         'serial_port': LaunchConfiguration('tof_port'),
-        #         'frame_id': 'tof_frame',
-        #     }],
-        #     output='screen',
-        #     remappings=[
-        #         ('range', '/mary/tof/range'),
-        #     ],
-        # ),
     ])

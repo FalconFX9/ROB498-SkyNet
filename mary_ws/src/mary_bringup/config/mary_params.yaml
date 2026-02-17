@@ -13,14 +13,6 @@ person_tracker_node:
     camera_fov_v: 48.8  # IMX219 vertical FOV
     publish_debug_image: true
 
-tof_processor_node:
-  ros__parameters:
-    filter_window_size: 5
-    outlier_threshold: 0.5
-    target_altitude: 2.5
-    altitude_deadband: 0.1
-    publish_rate: 20.0
-
 t265_pose_node:
   ros__parameters:
     publish_rate: 30.0

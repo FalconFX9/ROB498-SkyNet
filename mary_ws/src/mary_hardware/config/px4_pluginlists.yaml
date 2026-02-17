@@ -13,7 +13,6 @@
       - 'command'
       - 'ftp'
       - 'rc_io'
-      - 'distance_sensor'
       - 'vision_pose'
       - 'vision_speed'
       - 'odometry'

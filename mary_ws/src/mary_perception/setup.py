@@ -14,13 +14,12 @@ setup(
     zip_safe=True,
     maintainer='Your Name',
     maintainer_email='your.email@mail.utoronto.ca',
-    description='Perception package for MARY drone - person detection, tracking, and ToF processing',
+    description='Perception package for MARY drone - person detection and tracking',
     license='MIT',
     entry_points={
         'console_scripts': [
             't265_pose_node = mary_perception.t265_pose_node:main',
             'person_tracker_node = mary_perception.person_tracker_node:main',
-            'tof_processor_node = mary_perception.tof_processor_node:main',
         ],
     },
 )

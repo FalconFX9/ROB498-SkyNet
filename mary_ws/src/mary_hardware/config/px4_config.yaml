@@ -76,18 +76,6 @@
     tf.child_frame_id: "vision_estimate"
     tf.rate_limit: 10.0
 
-# Distance sensor (TeraRanger Evo 60m)
-/**/distance_sensor:
-  ros__parameters:
-    config: |
-      teraranger_evo:
-        id: 0
-        frame_id: "tof_frame"
-        orientation: PITCH_270  # Downward-facing
-        field_of_view: 0.035    # 2 degrees in radians
-        send_tf: true
-        sensor_position: {x: 0.0, y: 0.0, z: -0.05}
-
 # Odometry
 /**/odometry:
   ros__parameters:
