@@ -38,8 +38,19 @@ class T265PoseNode(Node):
         self.declare_parameter('drone_frame_id', 'base_link')
 
         # T265 to drone frame transformation
-        # T265 coordinate system: X-right, Y-down, Z-forward
-        # Drone NED: X-forward, Y-right, Z-down
+        # T265 mounted on bottom of drone, facing DOWN, lens pointing BACKWARD.
+        #
+        # Physical axis observations (from user):
+        #   T265 +X = right of drone
+        #   T265 +Y = drone down   (= NED +Z)
+        #   T265 +Z = drone backward (= NED -X)
+        #
+        # Because the T265 faces down, its left-right is mirrored relative to
+        # the drone's top-down view.  A proper rotation (det = +1) requires
+        # negating the X mapping as well:
+        #   NED +X (fwd)   = -T265 Z
+        #   NED +Y (right) = -T265 X   (mirrored by downward mount)
+        #   NED +Z (down)  =  T265 Y
         self.declare_parameter('camera_position_x', 0.0)  # Camera offset from drone center
         self.declare_parameter('camera_position_y', 0.0)
         self.declare_parameter('camera_position_z', 0.0)
@@ -49,6 +60,20 @@ class T265PoseNode(Node):
         self.publish_to_mavros = self.get_parameter('publish_to_mavros').value
         self.world_frame = self.get_parameter('world_frame_id').value
         self.drone_frame = self.get_parameter('drone_frame_id').value
+
+        # Precompute T265 → NED frame rotation (used every callback)
+        self._R_t265_to_ned = np.array([
+            [ 0, 0, -1],   # NED X (fwd)   = -T265 Z (backward → forward)
+            [-1, 0,  0],   # NED Y (right) = -T265 X (mirrored by down-facing mount)
+            [ 0, 1,  0],   # NED Z (down)  =  T265 Y
+        ])
+        # Equivalent quaternion [x, y, z, w] for the same rotation
+        self._q_t265_to_ned = tf_transformations.quaternion_from_matrix(
+            np.vstack([
+                np.hstack([self._R_t265_to_ned, np.zeros((3, 1))]),
+                [0, 0, 0, 1]
+            ])
+        )
 
         # State
         self.current_pose = None
@@ -103,7 +128,13 @@ class T265PoseNode(Node):
             msg.pose.pose.orientation.w
         ])
 
-        # Store initial pose for zeroing
+        # Validate quaternion — T265 publishes zeros during SLAM errors
+        quat_norm = np.linalg.norm(orientation)
+        if quat_norm < 1e-6:
+            return  # Skip invalid pose silently
+        orientation = orientation / quat_norm  # Normalize
+
+        # Store initial pose for zeroing (only after first valid pose)
         if not self.pose_initialized:
             self.initial_pose = {
                 'position': position.copy(),
@@ -112,8 +143,10 @@ class T265PoseNode(Node):
             self.pose_initialized = True
             self.get_logger().info('Initial pose captured - zeroing position')
 
-        # Transform from T265 frame to drone frame
+        # Transform from T265 frame to ENU
         transformed_pose = self.transform_t265_to_drone(position, orientation)
+        if transformed_pose is None:
+            return
 
         # Store current pose
         self.current_pose = {
@@ -124,37 +157,26 @@ class T265PoseNode(Node):
 
     def transform_t265_to_drone(self, position, orientation):
         """
-        Transform T265 pose to drone body frame.
+        Transform T265 pose to NED drone frame.
 
-        T265 uses: X-right, Y-down, Z-forward
-        Drone NED: X-forward, Y-right, Z-down
+        T265 (mounted facing down, lens backward):
+            +X = right,  +Y = down,  +Z = backward
+        NED:
+            +X = forward, +Y = right, +Z = down
         """
-        # Rotation matrix from T265 to drone frame
-        # This maps T265 axes to drone axes
-        R_t265_to_drone = np.array([
-            [0, 0, 1],   # Drone X = T265 Z (forward)
-            [1, 0, 0],   # Drone Y = T265 X (right)
-            [0, 1, 0]    # Drone Z = T265 Y (down)
-        ])
-
         # Transform position
         if self.initial_pose is not None:
-            # Zero to initial position
             relative_pos = position - self.initial_pose['position']
         else:
             relative_pos = position
 
-        transformed_position = R_t265_to_drone @ relative_pos
+        transformed_position = self._R_t265_to_ned @ relative_pos
 
-        # Transform orientation
-        # Convert quaternion to rotation matrix, apply transform, convert back
-        R_original = tf_transformations.quaternion_matrix(orientation)[:3, :3]
-        R_transformed = R_t265_to_drone @ R_original
-
-        # Pad to 4x4 for quaternion conversion
-        R_4x4 = np.eye(4)
-        R_4x4[:3, :3] = R_transformed
-        transformed_orientation = tf_transformations.quaternion_from_matrix(R_4x4)
+        # Transform orientation via quaternion multiplication
+        # (avoids fragile matrix decomposition that crashes on bad data)
+        transformed_orientation = tf_transformations.quaternion_multiply(
+            self._q_t265_to_ned, orientation
+        )
 
         return {
             'position': transformed_position,
