@@ -82,6 +82,7 @@ class StationkeepingNode(Node):
         self.last_mode_req_time = None       # rate-limit OFFBOARD requests
         self.last_arm_req_time  = None       # rate-limit arming requests
         self._hover_logged      = False      # one-shot log flag
+        self._offboard_achieved = False      # True once armed + OFFBOARD reached
 
         # ── Subscribers ───────────────────────────────────────────────────
         self.create_subscription(
@@ -242,6 +243,29 @@ class StationkeepingNode(Node):
 
     def _state_machine_loop(self):
         """Handle state-dependent logic at 10 Hz."""
+
+        # ── RC override / external disarm detection ──────────────────────
+        # Only trigger after we've been flying in OFFBOARD, to avoid
+        # false positives during the LAUNCH arming sequence.
+        if (self._offboard_achieved
+                and self.flight_state in ('LAUNCH', 'TEST', 'LAND')
+                and self.mavros_state is not None):
+
+            if self.mavros_state.mode != 'OFFBOARD':
+                self.get_logger().info(
+                    f'RC override detected (mode={self.mavros_state.mode}) '
+                    f'— releasing control to pilot'
+                )
+                self._reset_to_idle()
+                return
+
+            if not self.mavros_state.armed:
+                self.get_logger().info(
+                    'External disarm detected — resetting to IDLE'
+                )
+                self._reset_to_idle()
+                return
+
         if self.flight_state == 'LAUNCH':
             self._tick_launch()
         elif self.flight_state == 'LAND':
@@ -278,6 +302,7 @@ class StationkeepingNode(Node):
             return
 
         # Armed + OFFBOARD — hovering
+        self._offboard_achieved = True
         if not self._hover_logged:
             self.get_logger().info('Armed in OFFBOARD — hovering, ready for TEST')
             self._hover_logged = True
@@ -306,11 +331,12 @@ class StationkeepingNode(Node):
 
     def _reset_to_idle(self):
         """Clean up state and return to IDLE."""
-        self.flight_state    = 'IDLE'
-        self.hover_pose      = None
-        self.land_start_time = None
-        self.land_start_alt  = None
-        self._hover_logged   = False
+        self.flight_state       = 'IDLE'
+        self.hover_pose         = None
+        self.land_start_time    = None
+        self.land_start_alt     = None
+        self._hover_logged      = False
+        self._offboard_achieved = False
 
     # ── Course service handlers ───────────────────────────────────────────
 
@@ -352,6 +378,7 @@ class StationkeepingNode(Node):
         self.last_mode_req_time = None
         self.last_arm_req_time  = None
         self._hover_logged      = False
+        self._offboard_achieved = False
 
         self.get_logger().info(
             f'LAUNCH received — ascending to {self.takeoff_altitude}m'
@@ -420,9 +447,10 @@ class StationkeepingNode(Node):
         Immediately disarms the drone regardless of current state.
         """
         self.get_logger().warn('ABORT — emergency disarm')
-        self.flight_state    = 'ABORT'
-        self.hover_pose      = None
-        self.land_start_time = None
+        self.flight_state       = 'ABORT'
+        self.hover_pose         = None
+        self.land_start_time    = None
+        self._offboard_achieved = False
         self._request_arm(False)
 
         response.success = True
