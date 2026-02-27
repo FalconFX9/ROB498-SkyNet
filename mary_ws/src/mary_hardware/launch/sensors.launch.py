@@ -80,6 +80,7 @@ def generate_launch_description():
 
         # IMX219 via gscam2 with Jetson hardware ISP (nvarguscamerasrc)
         # sensor-id=0 for CAM0 port, sensor-id=1 for CAM1 port
+        # Camera is on CAM1 physically but enumerated as sensor-id=0
         Node(
             package='gscam2',
             executable='gscam_main',
@@ -89,7 +90,7 @@ def generate_launch_description():
                 'gscam_config': (
                     'nvarguscamerasrc sensor-id=0 ! '
                     'video/x-raw(memory:NVMM), width=1280, height=720, '
-                    'format=NV12, framerate=30/1 ! '
+                    'format=NV12, framerate=60/1 ! '  # 30fps not native at 720p; use 60fps
                     'nvvidconv ! video/x-raw, format=BGRx ! '
                     'videoconvert ! video/x-raw, format=BGR'
                 ),

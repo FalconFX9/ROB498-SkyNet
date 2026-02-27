@@ -33,6 +33,7 @@ class T265PoseNode(Node):
         # Parameters
         self.declare_parameter('publish_rate', 30.0)  # Hz
         self.declare_parameter('publish_tf', True)
+        self.declare_parameter('publish_to_mavros', True)  # Set False when another node relays
         self.declare_parameter('world_frame_id', 'map')
         self.declare_parameter('drone_frame_id', 'base_link')
 
@@ -45,6 +46,7 @@ class T265PoseNode(Node):
 
         # Get parameters
         self.publish_tf = self.get_parameter('publish_tf').value
+        self.publish_to_mavros = self.get_parameter('publish_to_mavros').value
         self.world_frame = self.get_parameter('world_frame_id').value
         self.drone_frame = self.get_parameter('drone_frame_id').value
 
@@ -178,10 +180,11 @@ class T265PoseNode(Node):
         pose_msg.pose.orientation.z = float(self.current_pose['orientation'][2])
         pose_msg.pose.orientation.w = float(self.current_pose['orientation'][3])
 
-        # Publish to MAVROS
-        self.mavros_pose_pub.publish(pose_msg)
+        # Publish to MAVROS (can be disabled when another node handles relay)
+        if self.publish_to_mavros:
+            self.mavros_pose_pub.publish(pose_msg)
 
-        # Publish to MARY localization topic
+        # Publish to MARY localization topic (always)
         self.pose_pub.publish(pose_msg)
 
         # Publish TF if enabled
