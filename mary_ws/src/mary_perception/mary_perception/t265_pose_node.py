@@ -63,9 +63,9 @@ class T265PoseNode(Node):
 
         # Precompute T265 → NED frame rotation (used every callback)
         self._R_t265_to_ned = np.array([
-            [ 0, 0, -1],   # NED X (fwd)   = -T265 Z (backward → forward)
-            [-1, 0,  0],   # NED Y (right) = -T265 X (mirrored by down-facing mount)
-            [ 0, 1,  0],   # NED Z (down)  =  T265 Y
+            [-1, 0, 0],   # NED X (fwd)   = -T265 Z (backward → forward)
+            [0, -1,  0],   # NED Y (right) = -T265 X (mirrored by down-facing mount)
+            [ 0, 0,  1],   # NED Z (down)  =  T265 Y
         ])
         # Equivalent quaternion [x, y, z, w] for the same rotation
         self._q_t265_to_ned = tf_transformations.quaternion_from_matrix(
