@@ -37,20 +37,12 @@ class T265PoseNode(Node):
         self.declare_parameter('world_frame_id', 'map')
         self.declare_parameter('drone_frame_id', 'base_link')
 
-        # T265 to drone frame transformation
-        # T265 mounted on bottom of drone, facing DOWN, lens pointing BACKWARD.
-        #
-        # Physical axis observations (from user):
-        #   T265 +X = right of drone
-        #   T265 +Y = drone down   (= NED +Z)
-        #   T265 +Z = drone backward (= NED -X)
-        #
-        # Because the T265 faces down, its left-right is mirrored relative to
-        # the drone's top-down view.  A proper rotation (det = +1) requires
-        # negating the X mapping as well:
-        #   NED +X (fwd)   = -T265 Z
-        #   NED +Y (right) = -T265 X   (mirrored by downward mount)
-        #   NED +Z (down)  =  T265 Y
+        # T265 → ENU frame rotation (180° about Z axis)
+        # T265 mounted on bottom of drone, facing DOWN, lenses BACKWARD.
+        # Empirically verified mapping to ENU for MAVROS vision_pose:
+        #   ENU +X (East  / right)   = -T265 X
+        #   ENU +Y (North / forward) = -T265 Y
+        #   ENU +Z (Up)              = +T265 Z
         self.declare_parameter('camera_position_x', 0.0)  # Camera offset from drone center
         self.declare_parameter('camera_position_y', 0.0)
         self.declare_parameter('camera_position_z', 0.0)
@@ -61,16 +53,16 @@ class T265PoseNode(Node):
         self.world_frame = self.get_parameter('world_frame_id').value
         self.drone_frame = self.get_parameter('drone_frame_id').value
 
-        # Precompute T265 → NED frame rotation (used every callback)
-        self._R_t265_to_ned = np.array([
-            [-1, 0, 0],   # NED X (fwd)   = -T265 Z (backward → forward)
-            [0, -1,  0],   # NED Y (right) = -T265 X (mirrored by down-facing mount)
-            [ 0, 0,  1],   # NED Z (down)  =  T265 Y
+        # Precompute T265 → ENU frame rotation (used every callback)
+        self._R_t265_to_enu = np.array([
+            [-1,  0, 0],
+            [ 0, -1, 0],
+            [ 0,  0, 1],
         ])
         # Equivalent quaternion [x, y, z, w] for the same rotation
-        self._q_t265_to_ned = tf_transformations.quaternion_from_matrix(
+        self._q_t265_to_enu = tf_transformations.quaternion_from_matrix(
             np.vstack([
-                np.hstack([self._R_t265_to_ned, np.zeros((3, 1))]),
+                np.hstack([self._R_t265_to_enu, np.zeros((3, 1))]),
                 [0, 0, 0, 1]
             ])
         )
@@ -156,26 +148,18 @@ class T265PoseNode(Node):
         }
 
     def transform_t265_to_drone(self, position, orientation):
-        """
-        Transform T265 pose to NED drone frame.
-
-        T265 (mounted facing down, lens backward):
-            +X = right,  +Y = down,  +Z = backward
-        NED:
-            +X = forward, +Y = right, +Z = down
-        """
+        """Transform T265 pose to ENU frame for MAVROS."""
         # Transform position
         if self.initial_pose is not None:
             relative_pos = position - self.initial_pose['position']
         else:
             relative_pos = position
 
-        transformed_position = self._R_t265_to_ned @ relative_pos
+        transformed_position = self._R_t265_to_enu @ relative_pos
 
         # Transform orientation via quaternion multiplication
-        # (avoids fragile matrix decomposition that crashes on bad data)
         transformed_orientation = tf_transformations.quaternion_multiply(
-            self._q_t265_to_ned, orientation
+            self._q_t265_to_enu, orientation
         )
 
         return {

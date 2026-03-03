@@ -26,6 +26,9 @@ Subscribed topics:
     <vicon_topic>                     VICON pose (Part I, configurable)
 """
 
+import numpy as np
+import tf_transformations
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
@@ -45,16 +48,18 @@ class StationkeepingNode(Node):
 
         # ── Parameters ────────────────────────────────────────────────────
         self.declare_parameter('drone_id',              'rob498_drone_10')
-        self.declare_parameter('takeoff_altitude',      0.5)     # m  (Exercise #2: 50 cm)
+        self.declare_parameter('takeoff_altitude',      0.5)     # m
         self.declare_parameter('setpoint_rate',         20.0)    # Hz (must be > 2 Hz for PX4)
         self.declare_parameter('vision_pose_rate',      30.0)    # Hz
         self.declare_parameter('descent_speed',         0.15)    # m/s during landing
-        self.declare_parameter('land_disarm_altitude',  0.12)    # m — disarm below this
+        self.declare_parameter('land_disarm_altitude',  0.0)     # m — disarm at ground
         self.declare_parameter('offboard_wait',         1.5)     # s before OFFBOARD request
         self.declare_parameter('mode_request_interval', 2.0)     # s between OFFBOARD/arm retries
         self.declare_parameter('land_timeout',          15.0)    # s — force disarm safety net
         self.declare_parameter('vicon_topic',           '')      # VICON PoseStamped topic
         self.declare_parameter('vicon_timeout',         0.5)     # s before VICON fallback
+        self.declare_parameter('t265_z_offset',         0.0)     # m — added to T265 Z (from calibration)
+        self.declare_parameter('calibration_duration',  10.0)    # s — height calibration collection time
 
         drone_id                = self.get_parameter('drone_id').value
         self.takeoff_altitude   = self.get_parameter('takeoff_altitude').value
@@ -67,6 +72,8 @@ class StationkeepingNode(Node):
         self.land_timeout       = self.get_parameter('land_timeout').value
         vicon_topic             = self.get_parameter('vicon_topic').value
         self.vicon_timeout      = self.get_parameter('vicon_timeout').value
+        self.t265_z_offset      = self.get_parameter('t265_z_offset').value
+        self.calibration_dur    = self.get_parameter('calibration_duration').value
 
         # ── State ─────────────────────────────────────────────────────────
         self.flight_state       = 'IDLE'
@@ -83,6 +90,24 @@ class StationkeepingNode(Node):
         self.last_arm_req_time  = None       # rate-limit arming requests
         self._hover_logged      = False      # one-shot log flag
         self._offboard_achieved = False      # True once armed + OFFBOARD reached
+        self._raw_t265_z        = None       # pre-offset T265 Z for calibration
+        self._cal_active        = False      # height calibration in progress
+        self._cal_samples       = []         # list of (vicon_z, raw_t265_z)
+        self._cal_start         = None       # calibration start time
+
+        # ── VICON → ENU frame rotation ────────────────────────────────────
+        # VICON frame is already aligned with ENU — identity transform.
+        self._R_vicon_to_enu = np.array([
+            [1, 0,  0],
+            [0, 1,  0],
+            [0, 0, 1],
+        ])
+        self._q_vicon_to_enu = tf_transformations.quaternion_from_matrix(
+            np.vstack([
+                np.hstack([self._R_vicon_to_enu, np.zeros((3, 1))]),
+                [0, 0, 0, 1]
+            ])
+        )
 
         # ── Subscribers ───────────────────────────────────────────────────
         self.create_subscription(
@@ -119,10 +144,11 @@ class StationkeepingNode(Node):
         self.set_mode_client = self.create_client(SetMode,     '/mavros/set_mode')
 
         # ── Course service servers ────────────────────────────────────────
-        self.create_service(Trigger, f'{drone_id}/comm/launch', self._handle_launch)
-        self.create_service(Trigger, f'{drone_id}/comm/test',   self._handle_test)
-        self.create_service(Trigger, f'{drone_id}/comm/land',   self._handle_land)
-        self.create_service(Trigger, f'{drone_id}/comm/abort',  self._handle_abort)
+        self.create_service(Trigger, f'{drone_id}/comm/launch',    self._handle_launch)
+        self.create_service(Trigger, f'{drone_id}/comm/test',      self._handle_test)
+        self.create_service(Trigger, f'{drone_id}/comm/land',      self._handle_land)
+        self.create_service(Trigger, f'{drone_id}/comm/abort',     self._handle_abort)
+        self.create_service(Trigger, f'{drone_id}/comm/calibrate', self._handle_calibrate)
 
         # ── Timers ────────────────────────────────────────────────────────
         self.create_timer(1.0 / setpoint_rate, self._setpoint_loop)
@@ -141,11 +167,33 @@ class StationkeepingNode(Node):
         self.mavros_state = msg
 
     def _on_t265_pose(self, msg):
+        self._raw_t265_z = msg.pose.position.z
+        msg.pose.position.z += self.t265_z_offset
         self.t265_pose  = msg
         self.t265_stamp = self.get_clock().now()
 
     def _on_vicon_pose(self, msg):
-        self.vicon_pose  = msg
+        # Transform VICON frame → ENU
+        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        enu_pos = self._R_vicon_to_enu @ pos
+
+        quat = np.array([
+            msg.pose.orientation.x, msg.pose.orientation.y,
+            msg.pose.orientation.z, msg.pose.orientation.w,
+        ])
+        enu_quat = tf_transformations.quaternion_multiply(self._q_vicon_to_enu, quat)
+
+        transformed = PoseStamped()
+        transformed.header = msg.header
+        transformed.pose.position.x = float(enu_pos[0])
+        transformed.pose.position.y = float(enu_pos[1])
+        transformed.pose.position.z = float(enu_pos[2])
+        transformed.pose.orientation.x = float(enu_quat[0])
+        transformed.pose.orientation.y = float(enu_quat[1])
+        transformed.pose.orientation.z = float(enu_quat[2])
+        transformed.pose.orientation.w = float(enu_quat[3])
+
+        self.vicon_pose  = transformed
         self.vicon_stamp = self.get_clock().now()
 
     # ── Pose source management ────────────────────────────────────────────
@@ -223,9 +271,9 @@ class StationkeepingNode(Node):
             if self.land_start_time is not None:
                 elapsed  = (self.get_clock().now() - self.land_start_time).nanoseconds * 1e-9
                 target_z = self.land_start_alt - self.descent_speed * elapsed
-                msg.pose.position.z = max(target_z, 0.03)
+                msg.pose.position.z = max(target_z, 0.0)
             else:
-                msg.pose.position.z = 0.03
+                msg.pose.position.z = 0.0
 
         elif self.flight_state == 'ABORT':
             self._broadcast_state()
@@ -265,6 +313,9 @@ class StationkeepingNode(Node):
                 )
                 self._reset_to_idle()
                 return
+
+        if self._cal_active:
+            self._tick_calibration()
 
         if self.flight_state == 'LAUNCH':
             self._tick_launch()
@@ -308,26 +359,13 @@ class StationkeepingNode(Node):
             self._hover_logged = True
 
     def _tick_land(self):
-        """During LAND: monitor altitude and disarm when near ground."""
-        now     = self.get_clock().now()
-        elapsed = (now - self.land_start_time).nanoseconds * 1e-9
-
+        """During LAND: ramp Z setpoint to ground. Manual disarm required."""
         pose = self._get_active_pose()
         if pose is not None:
             alt = pose.pose.position.z
-            if alt < self.land_disarm_alt:
-                self.get_logger().info(
-                    f'Altitude {alt:.2f}m < {self.land_disarm_alt}m — disarming'
-                )
-                self._request_arm(False)
-                self._reset_to_idle()
-                return
-
-        # Safety timeout: force disarm if landing takes too long
-        if elapsed > self.land_timeout:
-            self.get_logger().warn('Landing timeout — forcing disarm')
-            self._request_arm(False)
-            self._reset_to_idle()
+            if alt <= 0.02 and not getattr(self, '_landed_logged', False):
+                self.get_logger().info('On the ground — disarm manually or call abort')
+                self._landed_logged = True
 
     def _reset_to_idle(self):
         """Clean up state and return to IDLE."""
@@ -337,6 +375,7 @@ class StationkeepingNode(Node):
         self.land_start_alt     = None
         self._hover_logged      = False
         self._offboard_achieved = False
+        self._landed_logged     = False
 
     # ── Course service handlers ───────────────────────────────────────────
 
@@ -456,6 +495,88 @@ class StationkeepingNode(Node):
         response.success = True
         response.message = 'Emergency stop executed'
         return response
+
+    def _handle_calibrate(self, request, response):
+        """
+        Handle CALIBRATE command.
+
+        Collects simultaneous VICON and T265 Z samples for calibration_duration
+        seconds, then computes the median offset to align T265 height with VICON.
+        Must be run with Part 1 (VICON active).
+        """
+        if self.vicon_pose is None:
+            response.success = False
+            response.message = 'No VICON data — run with part:=1 for calibration'
+            return response
+        if self.t265_pose is None:
+            response.success = False
+            response.message = 'No T265 data available'
+            return response
+
+        self._cal_active  = True
+        self._cal_samples = []
+        self._cal_start   = self.get_clock().now()
+
+        self.get_logger().info(
+            f'Height calibration started — collecting for {self.calibration_dur}s'
+        )
+        response.success = True
+        response.message = f'Collecting samples for {self.calibration_dur}s'
+        return response
+
+    # ── Height calibration ───────────────────────────────────────────────
+
+    def _tick_calibration(self):
+        """Collect paired VICON/T265 Z samples at 10 Hz."""
+        now     = self.get_clock().now()
+        elapsed = (now - self._cal_start).nanoseconds * 1e-9
+
+        if elapsed >= self.calibration_dur:
+            self._finish_calibration()
+            return
+
+        # Both sources must be fresh
+        if (self.vicon_pose is not None and self.vicon_stamp is not None
+                and self._raw_t265_z is not None and self.t265_stamp is not None):
+            vicon_age = (now - self.vicon_stamp).nanoseconds * 1e-9
+            t265_age  = (now - self.t265_stamp).nanoseconds * 1e-9
+
+            if vicon_age < self.vicon_timeout and t265_age < 0.5:
+                vicon_z = self.vicon_pose.pose.position.z
+                self._cal_samples.append((vicon_z, self._raw_t265_z))
+
+    def _finish_calibration(self):
+        """Compute and apply the median Z offset."""
+        self._cal_active = False
+        n = len(self._cal_samples)
+
+        if n < 10:
+            self.get_logger().warn(
+                f'Calibration failed — only {n} samples (need >= 10). '
+                f'Ensure both VICON and T265 are streaming.'
+            )
+            return
+
+        vicon_zs = np.array([s[0] for s in self._cal_samples])
+        t265_zs  = np.array([s[1] for s in self._cal_samples])
+        offsets  = vicon_zs - t265_zs
+
+        median_off = float(np.median(offsets))
+        mean_off   = float(np.mean(offsets))
+        std_off    = float(np.std(offsets))
+
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('HEIGHT CALIBRATION COMPLETE')
+        self.get_logger().info(f'  Samples:       {n}')
+        self.get_logger().info(f'  Median offset: {median_off:+.4f} m')
+        self.get_logger().info(f'  Mean offset:   {mean_off:+.4f} m')
+        self.get_logger().info(f'  Std dev:       {std_off:.4f} m')
+        self.get_logger().info(f'  VICON Z  avg:  {float(np.mean(vicon_zs)):.4f} m')
+        self.get_logger().info(f'  T265 Z   avg:  {float(np.mean(t265_zs)):.4f} m')
+        self.get_logger().info(f'')
+        self.get_logger().info(f'  Use in a future launch:')
+        self.get_logger().info(f'    t265_z_offset:={median_off:.4f}')
+        self.get_logger().info('=' * 60)
 
     # ── MAVROS helpers ────────────────────────────────────────────────────
 

@@ -8,20 +8,51 @@ Launches the minimal set of nodes required for the stationkeeping exercise:
   - Stationkeeping (hover controller + course interface)
 
 Usage:
-  # Part I  — VICON-aided (default — uses /vicon/ROB498_Drone/ROB498_Drone):
-  ros2 launch mary_bringup flight_test_2.launch.py
+  # Part I  — VICON-aided:
+  ros2 launch mary_bringup flight_test_2.launch.py part:=1
 
   # Part II — on-board sensing only (T265, no VICON):
-  ros2 launch mary_bringup flight_test_2.launch.py vicon_topic:=
+  ros2 launch mary_bringup flight_test_2.launch.py part:=2
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
+
+
+VICON_TOPIC = '/vicon/ROB498_Drone/ROB498_Drone'
+
+
+def _resolve_params(context):
+    """Pick vicon_topic based on the 'part' argument."""
+    part = int(LaunchConfiguration('part').perform(context))
+    vicon_topic = VICON_TOPIC if part == 1 else ''
+    return [
+        Node(
+            package='mary_control',
+            executable='stationkeeping_node',
+            name='stationkeeping_node',
+            output='screen',
+            parameters=[{
+                'drone_id':             LaunchConfiguration('drone_id'),
+                'takeoff_altitude':     0.5,    # 20 cm — Part II test height
+                'setpoint_rate':        20.0,
+                'vision_pose_rate':     30.0,
+                'descent_speed':        0.15,   # m/s — gentle landing
+                'land_disarm_altitude': 0.0,
+                'offboard_wait':        1.5,
+                'land_timeout':         15.0,
+                'vicon_topic':          vicon_topic,
+                'vicon_timeout':        0.5,
+                't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
+                'calibration_duration': 10.0,
+            }],
+        ),
+    ]
 
 
 def generate_launch_description():
@@ -41,9 +72,14 @@ def generate_launch_description():
             description='FCU serial connection URL',
         ),
         DeclareLaunchArgument(
-            'vicon_topic',
-            default_value='/vicon/ROB498_Drone/ROB498_Drone',
-            description='VICON PoseStamped topic (set empty for Part II / T265 only)',
+            'part',
+            default_value='2',
+            description='Flight test part: 1 = VICON, 2 = T265 only',
+        ),
+        DeclareLaunchArgument(
+            't265_z_offset',
+            default_value='0.0',
+            description='T265 height offset in metres (from calibration)',
         ),
 
         # ── Hardware layer ────────────────────────────────────────────────
@@ -100,25 +136,5 @@ def generate_launch_description():
         ),
 
         # ── Control layer ─────────────────────────────────────────────────
-
-        # Stationkeeping controller — handles course services, pose relay,
-        # hover setpoints, autonomous takeoff / landing.
-        Node(
-            package='mary_control',
-            executable='stationkeeping_node',
-            name='stationkeeping_node',
-            output='screen',
-            parameters=[{
-                'drone_id':             LaunchConfiguration('drone_id'),
-                'takeoff_altitude':     0.5,    # 50 cm — Exercise #2 requirement
-                'setpoint_rate':        20.0,
-                'vision_pose_rate':     30.0,
-                'descent_speed':        0.15,   # m/s — gentle landing
-                'land_disarm_altitude': 0.12,
-                'offboard_wait':        1.5,
-                'land_timeout':         15.0,
-                'vicon_topic':          LaunchConfiguration('vicon_topic'),
-                'vicon_timeout':        0.5,
-            }],
-        ),
+        OpaqueFunction(function=_resolve_params),
     ])
