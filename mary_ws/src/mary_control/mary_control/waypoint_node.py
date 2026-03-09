@@ -45,7 +45,8 @@ class WaypointNode(Node):
     """Waypoint navigation controller for Flight Test #3."""
 
     def __init__(self):
-        super().__init__('waypoint_node')
+        # Course skeleton requires node name = drone_id
+        super().__init__('rob498_drone_10')
 
         # ── Parameters ──────────────────────────────────────────────────
         self.declare_parameter('drone_id',              'rob498_drone_10')
