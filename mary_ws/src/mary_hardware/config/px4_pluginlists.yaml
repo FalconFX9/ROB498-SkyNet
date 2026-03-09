@@ -4,7 +4,6 @@
   ros__parameters:
     plugin_allowlist:
       - 'sys_*'
-      - 'param'
       - 'imu'
       - 'gps'
       - 'local_position'
@@ -21,6 +20,7 @@
     plugin_denylist:
       - 'actuator_control'
       - 'hil'
+      - 'param'
       - 'safety_area'
       - 'debug_value'
       - 'vibration'
