@@ -23,6 +23,7 @@ setup(
             'altitude_controller_node = mary_control.altitude_controller_node:main',
             'mission_manager_node = mary_control.mission_manager_node:main',
             'stationkeeping_node = mary_control.stationkeeping_node:main',
+            'waypoint_node = mary_control.waypoint_node:main',
         ],
     },
 )

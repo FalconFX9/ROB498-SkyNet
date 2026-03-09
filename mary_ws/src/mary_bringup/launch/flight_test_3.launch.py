@@ -1,18 +1,21 @@
 """
-Flight Test #2: Stationkeeping — Launch File
+Flight Test #3: Waypoint Navigation — Launch File
 
-Launches the minimal set of nodes required for the stationkeeping exercise:
+Launches the nodes required for the waypoint navigation exercise:
   - MAVROS        (FCU bridge)
-  - Sensors       (T265 tracking camera)
+  - T265 camera   (tracking camera driver)
   - T265 Pose     (VIO processing — MAVROS relay disabled)
-  - Stationkeeping (hover controller + course interface)
+  - Waypoint Node (waypoint controller + course interface)
 
 Usage:
   # Part I  — VICON-aided:
-  ros2 launch mary_bringup flight_test_2.launch.py part:=1
+  ros2 launch mary_bringup flight_test_3.launch.py part:=1
 
   # Part II — on-board sensing only (T265, no VICON):
-  ros2 launch mary_bringup flight_test_2.launch.py part:=2
+  ros2 launch mary_bringup flight_test_3.launch.py part:=2
+
+  # With calibrated T265 offset:
+  ros2 launch mary_bringup flight_test_3.launch.py part:=2 t265_z_offset:=0.1234
 """
 
 from launch import LaunchDescription
@@ -28,28 +31,27 @@ VICON_TOPIC = '/vicon/ROB498_Drone/ROB498_Drone'
 
 
 def _resolve_params(context):
-    """Pick vicon_topic based on the 'part' argument."""
+    """Pick vicon_topic and configure waypoint node based on 'part' argument."""
     part = int(LaunchConfiguration('part').perform(context))
     vicon_topic = VICON_TOPIC if part == 1 else ''
     return [
         Node(
             package='mary_control',
-            executable='stationkeeping_node',
-            name='stationkeeping_node',
+            executable='waypoint_node',
+            name='waypoint_node',
             output='screen',
             parameters=[{
                 'drone_id':             LaunchConfiguration('drone_id'),
-                'takeoff_altitude':     0.5,    # 20 cm — Part II test height
+                'takeoff_altitude':     0.5,
                 'setpoint_rate':        20.0,
                 'vision_pose_rate':     30.0,
-                'descent_speed':        0.15,   # m/s — gentle landing
-                'land_disarm_altitude': 0.0,
+                'descent_speed':        0.15,
                 'offboard_wait':        1.5,
-                'land_timeout':         15.0,
+                'mode_request_interval': 2.0,
                 'vicon_topic':          vicon_topic,
                 'vicon_timeout':        0.5,
                 't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
-                'calibration_duration': 10.0,
+                'reach_radius':         0.4,
             }],
         ),
     ]
@@ -60,7 +62,7 @@ def generate_launch_description():
 
     return LaunchDescription([
 
-        # ── Arguments ─────────────────────────────────────────────────────
+        # ── Arguments ─────────────────────────────────────────────────
         DeclareLaunchArgument(
             'drone_id',
             default_value='rob498_drone_10',
@@ -78,7 +80,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'part',
-            default_value='2',
+            default_value='1',
             description='Flight test part: 1 = VICON, 2 = T265 only',
         ),
         DeclareLaunchArgument(
@@ -87,7 +89,7 @@ def generate_launch_description():
             description='T265 height offset in metres (from calibration)',
         ),
 
-        # ── Hardware layer ────────────────────────────────────────────────
+        # ── Hardware layer ────────────────────────────────────────────
 
         # MAVROS — bridges Jetson ↔ PX4 via MAVLink
         IncludeLaunchDescription(
@@ -100,47 +102,45 @@ def generate_launch_description():
             }.items(),
         ),
 
-        # T265 tracking camera only (IMX219 not needed for stationkeeping)
+        # T265 tracking camera
         Node(
             package='realsense2_camera',
             executable='realsense2_camera_node',
             name='t265_camera',
             namespace='camera',
             parameters=[{
-                'serial_no': '',
-                'device_type': 't265',
-                'enable_pose': True,
-                'enable_fisheye1': True,
-                'enable_fisheye2': True,
-                'fisheye_fps': 30,
-                'pose_fps': 200,
-                'publish_odom_tf': False,
+                'serial_no':         '',
+                'device_type':       't265',
+                'enable_pose':       True,
+                'enable_fisheye1':   True,
+                'enable_fisheye2':   True,
+                'fisheye_fps':       30,
+                'pose_fps':          200,
+                'publish_odom_tf':   False,
             }],
             output='screen',
             remappings=[
-                ('pose/sample', '/camera/pose/sample'),
-                ('fisheye1/image_raw', '/camera/fisheye1/image_raw'),
-                ('fisheye2/image_raw', '/camera/fisheye2/image_raw'),
+                ('pose/sample',          '/camera/pose/sample'),
+                ('fisheye1/image_raw',   '/camera/fisheye1/image_raw'),
+                ('fisheye2/image_raw',   '/camera/fisheye2/image_raw'),
             ],
         ),
 
-        # ── Perception layer ──────────────────────────────────────────────
+        # ── Perception layer ──────────────────────────────────────────
 
-        # T265 pose processing — publishes to /mary/localization/pose only;
-        # MAVROS relay is handled by the stationkeeping node to avoid
-        # conflicting pose sources when VICON is active.
+        # T265 pose processing — MAVROS relay disabled (waypoint node handles it)
         Node(
             package='mary_perception',
             executable='t265_pose_node',
             name='t265_pose_node',
             output='screen',
             parameters=[{
-                'publish_rate': 30.0,
-                'publish_tf': True,
+                'publish_rate':      30.0,
+                'publish_tf':        True,
                 'publish_to_mavros': False,
             }],
         ),
 
-        # ── Control layer ─────────────────────────────────────────────────
+        # ── Control layer ─────────────────────────────────────────────
         OpaqueFunction(function=_resolve_params),
     ])
