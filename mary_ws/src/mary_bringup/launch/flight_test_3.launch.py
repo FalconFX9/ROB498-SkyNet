@@ -50,6 +50,7 @@ def _resolve_params(context):
                 'mode_request_interval': 2.0,
                 'vicon_topic':          vicon_topic,
                 'vicon_timeout':        0.5,
+                'vicon_yaw_offset':     float(LaunchConfiguration('vicon_yaw_offset').perform(context)),
                 't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
                 'reach_radius':         0.4,
             }],
@@ -75,7 +76,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'gcs_url',
-            default_value='udp://@100.66.203.34:14550',
+            default_value='udp://@10.42.0.129:14550',
             description='GCS URL',
         ),
         DeclareLaunchArgument(
@@ -87,6 +88,11 @@ def generate_launch_description():
             't265_z_offset',
             default_value='0.0',
             description='T265 height offset in metres (from calibration)',
+        ),
+        DeclareLaunchArgument(
+            'vicon_yaw_offset',
+            default_value='0.0',
+            description='Vicon rigid body yaw correction in radians (positive=CCW)',
         ),
 
         # ── Hardware layer ────────────────────────────────────────────

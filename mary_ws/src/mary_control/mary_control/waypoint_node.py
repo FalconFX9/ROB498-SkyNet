@@ -58,6 +58,7 @@ class WaypointNode(Node):
         self.declare_parameter('mode_request_interval', 2.0)     # s between retries
         self.declare_parameter('vicon_topic',           '')       # empty → Part II
         self.declare_parameter('vicon_timeout',         0.5)     # s
+        self.declare_parameter('vicon_yaw_offset',      0.0)     # rad — additional yaw trim on top of body correction
         self.declare_parameter('t265_z_offset',         0.0)     # m (calibration)
         self.declare_parameter('reach_radius',          0.4)     # 40 cm sphere
 
@@ -70,6 +71,7 @@ class WaypointNode(Node):
         self.mode_req_interval = self.get_parameter('mode_request_interval').value
         vicon_topic            = self.get_parameter('vicon_topic').value
         self.vicon_timeout     = self.get_parameter('vicon_timeout').value
+        self.vicon_yaw_offset  = self.get_parameter('vicon_yaw_offset').value
         self.t265_z_offset     = self.get_parameter('t265_z_offset').value
         self.reach_radius      = self.get_parameter('reach_radius').value
 
@@ -103,14 +105,38 @@ class WaypointNode(Node):
         self.frame_offset_computed = False
         self.use_vicon             = bool(vicon_topic)
 
-        # ── VICON → ENU rotation (identity — Vicon already ENU) ────────
-        self._R_vicon_to_enu = np.eye(3)
-        self._q_vicon_to_enu = tf_transformations.quaternion_from_matrix(
+        # ── Vicon body-frame orientation correction ─────────────────────
+        # Vicon global frame is already ENU — position needs no rotation.
+        # The Vicon rigid body axes don't match the drone's actual body
+        # axes.  Measured transform (Vicon body → drone body):
+        #   X_drone = −Z_vicon_body
+        #   Y_drone = −Y_vicon_body
+        #   Z_drone = −X_vicon_body
+        # corrected_quat = q_body_correction * vicon_quat
+        R_body = np.array([
+            [ 0,  0, -1],
+            [ 0, -1,  0],
+            [-1,  0,  0],
+        ])
+        self._q_vicon_body_correction = tf_transformations.quaternion_from_matrix(
             np.vstack([
-                np.hstack([self._R_vicon_to_enu, np.zeros((3, 1))]),
+                np.hstack([R_body, np.zeros((3, 1))]),
                 [0, 0, 0, 1],
             ])
         )
+        # Optional additional yaw trim (from launch param) on top of body correction
+        if self.vicon_yaw_offset != 0.0:
+            q_yaw_trim = tf_transformations.quaternion_from_euler(
+                0.0, 0.0, self.vicon_yaw_offset
+            )
+            self._q_vicon_body_correction = tf_transformations.quaternion_multiply(
+                q_yaw_trim, self._q_vicon_body_correction
+            )
+            self.get_logger().info(
+                f'Vicon body correction + yaw trim {np.degrees(self.vicon_yaw_offset):.1f}°'
+            )
+        else:
+            self.get_logger().info('Vicon body-frame correction active')
 
         # ── Subscribers ─────────────────────────────────────────────────
         self.create_subscription(
@@ -175,24 +201,24 @@ class WaypointNode(Node):
         self.t265_stamp = self.get_clock().now()
 
     def _on_vicon_pose(self, msg):
-        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        enu_pos = self._R_vicon_to_enu @ pos
-
+        # Position: Vicon global frame is already ENU — pass through as-is
+        # Orientation: apply body-frame correction to align Vicon rigid body
+        # axes with the drone's actual body axes
         quat = np.array([
             msg.pose.orientation.x, msg.pose.orientation.y,
             msg.pose.orientation.z, msg.pose.orientation.w,
         ])
-        enu_quat = tf_transformations.quaternion_multiply(self._q_vicon_to_enu, quat)
+        corrected = tf_transformations.quaternion_multiply(
+            self._q_vicon_body_correction, quat
+        )
 
         transformed = PoseStamped()
-        transformed.header = msg.header
-        transformed.pose.position.x    = float(enu_pos[0])
-        transformed.pose.position.y    = float(enu_pos[1])
-        transformed.pose.position.z    = float(enu_pos[2])
-        transformed.pose.orientation.x = float(enu_quat[0])
-        transformed.pose.orientation.y = float(enu_quat[1])
-        transformed.pose.orientation.z = float(enu_quat[2])
-        transformed.pose.orientation.w = float(enu_quat[3])
+        transformed.header              = msg.header
+        transformed.pose.position       = msg.pose.position  # unchanged
+        transformed.pose.orientation.x  = float(corrected[0])
+        transformed.pose.orientation.y  = float(corrected[1])
+        transformed.pose.orientation.z  = float(corrected[2])
+        transformed.pose.orientation.w  = float(corrected[3])
 
         self.vicon_pose  = transformed
         self.vicon_stamp = self.get_clock().now()

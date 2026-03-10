@@ -95,19 +95,26 @@ class StationkeepingNode(Node):
         self._cal_samples       = []         # list of (vicon_z, raw_t265_z)
         self._cal_start         = None       # calibration start time
 
-        # ── VICON → ENU frame rotation ────────────────────────────────────
-        # VICON frame is already aligned with ENU — identity transform.
-        self._R_vicon_to_enu = np.array([
-            [1, 0,  0],
-            [0, 1,  0],
-            [0, 0, 1],
+        # ── Vicon body-frame orientation correction ────────────────────────
+        # Vicon global frame is already ENU — position needs no rotation.
+        # The Vicon rigid body axes don't match the drone's actual body
+        # axes.  Measured transform (Vicon body → drone body):
+        #   X_drone = −Z_vicon_body
+        #   Y_drone = −Y_vicon_body
+        #   Z_drone = −X_vicon_body
+        # corrected_quat = q_body_correction * vicon_quat
+        R_body = np.array([
+            [ 0,  0, -1],
+            [ 0, -1,  0],
+            [-1,  0,  0],
         ])
-        self._q_vicon_to_enu = tf_transformations.quaternion_from_matrix(
+        self._q_vicon_body_correction = tf_transformations.quaternion_from_matrix(
             np.vstack([
-                np.hstack([self._R_vicon_to_enu, np.zeros((3, 1))]),
-                [0, 0, 0, 1]
+                np.hstack([R_body, np.zeros((3, 1))]),
+                [0, 0, 0, 1],
             ])
         )
+        self.get_logger().info('Vicon body-frame correction active')
 
         # ── Subscribers ───────────────────────────────────────────────────
         self.create_subscription(
@@ -173,25 +180,24 @@ class StationkeepingNode(Node):
         self.t265_stamp = self.get_clock().now()
 
     def _on_vicon_pose(self, msg):
-        # Transform VICON frame → ENU
-        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        enu_pos = self._R_vicon_to_enu @ pos
-
+        # Position: Vicon global frame is already ENU — pass through as-is
+        # Orientation: apply body-frame correction to align Vicon rigid body
+        # axes with the drone's actual body axes
         quat = np.array([
             msg.pose.orientation.x, msg.pose.orientation.y,
             msg.pose.orientation.z, msg.pose.orientation.w,
         ])
-        enu_quat = tf_transformations.quaternion_multiply(self._q_vicon_to_enu, quat)
+        corrected = tf_transformations.quaternion_multiply(
+            self._q_vicon_body_correction, quat
+        )
 
         transformed = PoseStamped()
-        transformed.header = msg.header
-        transformed.pose.position.x = float(enu_pos[0])
-        transformed.pose.position.y = float(enu_pos[1])
-        transformed.pose.position.z = float(enu_pos[2])
-        transformed.pose.orientation.x = float(enu_quat[0])
-        transformed.pose.orientation.y = float(enu_quat[1])
-        transformed.pose.orientation.z = float(enu_quat[2])
-        transformed.pose.orientation.w = float(enu_quat[3])
+        transformed.header              = msg.header
+        transformed.pose.position       = msg.pose.position  # unchanged
+        transformed.pose.orientation.x  = float(corrected[0])
+        transformed.pose.orientation.y  = float(corrected[1])
+        transformed.pose.orientation.z  = float(corrected[2])
+        transformed.pose.orientation.w  = float(corrected[3])
 
         self.vicon_pose  = transformed
         self.vicon_stamp = self.get_clock().now()
