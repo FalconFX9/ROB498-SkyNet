@@ -38,7 +38,7 @@ def _resolve_params(context):
         Node(
             package='mary_control',
             executable='waypoint_node',
-            name='waypoint_node',
+            name='rob498_drone_10',
             output='screen',
             parameters=[{
                 'drone_id':             LaunchConfiguration('drone_id'),
@@ -75,7 +75,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'gcs_url',
-            default_value='udp://@100.66.197.133:14550',
+            default_value='udp://@100.66.203.34:14550',
             description='GCS URL',
         ),
         DeclareLaunchArgument(

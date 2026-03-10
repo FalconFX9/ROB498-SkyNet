@@ -117,6 +117,12 @@ self._R_t265_to_enu = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]])
 - **`flight_test_3.launch.py`** — Launch file mirroring FT2 but with waypoint_node.
 - **Entry point** registered in `mary_control/setup.py`.
 
+### FT2 Bug Fix Applied
+
+**Problem:** In FT2, the `stationkeeping_node` used `super().__init__('stationkeeping_node')` as the ROS node name. The course skeleton requires the node name to be the drone ID (e.g. `rob498_drone_10`). The TA's ground control server may discover services by node name.
+
+**Fix:** `waypoint_node.py` uses `super().__init__('rob498_drone_10')` matching the course skeleton convention. The stationkeeping_node still has the old name (not fixed — only used for FT2 which is complete).
+
 ### How It Works
 
 1. **Waypoints received** via `rob498_drone_10/comm/waypoints` (PoseArray) — stored as Nx3 numpy array. If >4 poses, first is treated as current Vicon position (for Part II frame alignment).
@@ -240,6 +246,7 @@ ROB498-SkyNet/
 - **ROS2 Foxy** (downgraded from Humble — see commit `95fff74`)
 - **Python build system** (switched from CMake — see commit `b5b8d92`)
 - **drone_id = `rob498_drone_10`** — Used for all course service naming
+- **ROS node name = `rob498_drone_10`** — Must match drone_id per course skeleton (FT2 had this wrong)
 - **Position setpoints** preferred over velocity for stability in flight tests
 - **T265 `publish_to_mavros=False`** in flight test launches to avoid relay conflicts
 - **Manual disarm** after landing — no auto-disarm to avoid accidental disarm in flight
