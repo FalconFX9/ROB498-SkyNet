@@ -31,7 +31,10 @@ def _resolve_params(context):
     """Pick vicon_topic based on the 'part' argument."""
     part = int(LaunchConfiguration('part').perform(context))
     vicon_topic = VICON_TOPIC if part == 1 else ''
-    return [
+    record_log = LaunchConfiguration('record_log').perform(context).lower() == 'true'
+    log_dir = LaunchConfiguration('log_dir').perform(context)
+
+    nodes = [
         Node(
             package='mary_control',
             executable='stationkeeping_node',
@@ -54,6 +57,17 @@ def _resolve_params(context):
             }],
         ),
     ]
+
+    if record_log:
+        nodes.append(Node(
+            package='mary_perception',
+            executable='pose_logger_node',
+            name='pose_logger_node',
+            output='screen',
+            parameters=[{'log_dir': log_dir}],
+        ))
+
+    return nodes
 
 
 def generate_launch_description():
@@ -91,6 +105,16 @@ def generate_launch_description():
             'log_euler',
             default_value='false',
             description='Log yaw/pitch/roll of pose topics at ~2 Hz',
+        ),
+        DeclareLaunchArgument(
+            'record_log',
+            default_value='false',
+            description='Enable flight logging (console + vision_pose CSV). Use record_flight.sh.',
+        ),
+        DeclareLaunchArgument(
+            'log_dir',
+            default_value='',
+            description='Directory to write flight logs into (set by record_flight.sh)',
         ),
 
         # ── Hardware layer ────────────────────────────────────────────────

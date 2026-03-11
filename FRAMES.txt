@@ -1,0 +1,57 @@
+1. Position:
+	have both real sense + VICON frame point x frame to window. z up. y away to wall.
+	ONLY REAL SENSE rotate 180 about z.
+2. Orientation:
+	In initialization, orientation needs to be identity when drone facing window for both.
+	
+	VICON rotate 180 about z.
+	REALSENSE rotate (rot VICON to realsense orient)^T * 180 about z.
+3. Test handedness of VICON frame? optional
+
+
+Actually I would like to make some changes to the position and orientation transform handling for realsense and VICON in both flight test 2 and 3.
+
+
+
+
+1. Position:
+	Add an extra REAL SENSE rotate 180 about z, for the position transform after its already current position transform.
+2. Orientation:
+- Turn the VICON transform back to identity for both orientation and position.
+- For VICON orientation, rotate 180 about its z. 
+	REALSENSE rotate (rot VICON to realsense orient)^T * 180 about z.
+
+T265 pos - 180 flip z
+T265 position - identity
+NED:
+x towards arthur
+y wall right
+z down
+
+
+VICON Frame:
+pos:
+x window
+y us
+z up
+
+
+Vision position estimate:
+position: same as local NED
+orientation: handedness opposite to local NED
+
+
+Orientation:
+T265 orient 
+	- vision_pose: yaw pi/2  (180 flip z)
+	- realsense
+rotate clockwise
+	- vision_pose: 0
+	- realsense
+
+NED orient
+	-pi/2
+rotate clockwise
+	- +pi/2 to 0
+(because z is 
+
