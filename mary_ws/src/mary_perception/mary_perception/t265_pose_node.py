@@ -56,8 +56,8 @@ class T265PoseNode(Node):
 
         # Precompute T265 → ENU frame rotation (used every callback)
         self._R_t265_to_enu = np.array([
-            [-1,  0, 0],
-            [ 0, -1, 0],
+            [1,  0, 0],
+            [ 0, 1, 0],
             [ 0,  0, 1],
         ])
         # Equivalent quaternion [x, y, z, w] for the same rotation
