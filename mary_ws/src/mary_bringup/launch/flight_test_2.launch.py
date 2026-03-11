@@ -142,7 +142,7 @@ def generate_launch_description():
                 'enable_pose': True,
                 'enable_fisheye1': True,
                 'enable_fisheye2': True,
-                'fisheye_fps': 30,
+                'fisheye_fps': 15,
                 'pose_fps': 200,
                 'publish_odom_tf': False,
             }],
