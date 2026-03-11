@@ -50,6 +50,7 @@ def _resolve_params(context):
                 'vicon_timeout':        0.5,
                 't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
                 'calibration_duration': 10.0,
+                'log_euler':           LaunchConfiguration('log_euler'),
             }],
         ),
     ]
@@ -85,6 +86,11 @@ def generate_launch_description():
             't265_z_offset',
             default_value='0.0',
             description='T265 height offset in metres (from calibration)',
+        ),
+        DeclareLaunchArgument(
+            'log_euler',
+            default_value='false',
+            description='Log yaw/pitch/roll of pose topics at ~2 Hz',
         ),
 
         # ── Hardware layer ────────────────────────────────────────────────
@@ -138,6 +144,7 @@ def generate_launch_description():
                 'publish_rate': 30.0,
                 'publish_tf': True,
                 'publish_to_mavros': False,
+                'log_euler': LaunchConfiguration('log_euler'),
             }],
         ),
 

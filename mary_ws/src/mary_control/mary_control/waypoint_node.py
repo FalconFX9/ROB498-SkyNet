@@ -34,7 +34,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
 
-from geometry_msgs.msg import PoseStamped, PoseArray
+from geometry_msgs.msg import PoseStamped, PoseArray, Vector3Stamped
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode
 from std_msgs.msg import String
@@ -61,6 +61,7 @@ class WaypointNode(Node):
         self.declare_parameter('vicon_yaw_offset',      0.0)     # rad — additional yaw trim on top of body correction
         self.declare_parameter('t265_z_offset',         0.0)     # m (calibration)
         self.declare_parameter('reach_radius',          0.4)     # 40 cm sphere
+        self.declare_parameter('log_euler',             False)   # Log RPY at ~2 Hz
 
         drone_id               = self.get_parameter('drone_id').value
         self.takeoff_altitude  = self.get_parameter('takeoff_altitude').value
@@ -74,6 +75,18 @@ class WaypointNode(Node):
         self.vicon_yaw_offset  = self.get_parameter('vicon_yaw_offset').value
         self.t265_z_offset     = self.get_parameter('t265_z_offset').value
         self.reach_radius      = self.get_parameter('reach_radius').value
+        self.log_euler         = self.get_parameter('log_euler').value
+        self._euler_vicon_ctr  = 0
+        self._euler_vision_ctr = 0
+
+        # Debug RPY publishers (created only when log_euler is enabled)
+        if self.log_euler:
+            self._pub_vicon_raw_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vicon_raw_rpy', 10)
+            self._pub_vicon_cor_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vicon_cor_rpy', 10)
+            self._pub_vision_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vision_rpy', 10)
 
         # ── Flight state ────────────────────────────────────────────────
         self.flight_state       = 'IDLE'
@@ -223,6 +236,25 @@ class WaypointNode(Node):
         self.vicon_pose  = transformed
         self.vicon_stamp = self.get_clock().now()
 
+        if self.log_euler:
+            stamp = self.get_clock().now().to_msg()
+            raw_rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [quat[0], quat[1], quat[2], quat[3]]))
+            cor_rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [corrected[0], corrected[1], corrected[2], corrected[3]]))
+
+            msg_raw = Vector3Stamped()
+            msg_raw.header.stamp = stamp
+            msg_raw.vector.x, msg_raw.vector.y, msg_raw.vector.z = \
+                float(raw_rpy[0]), float(raw_rpy[1]), float(raw_rpy[2])
+            self._pub_vicon_raw_rpy.publish(msg_raw)
+
+            msg_cor = Vector3Stamped()
+            msg_cor.header.stamp = stamp
+            msg_cor.vector.x, msg_cor.vector.y, msg_cor.vector.z = \
+                float(cor_rpy[0]), float(cor_rpy[1]), float(cor_rpy[2])
+            self._pub_vicon_cor_rpy.publish(msg_cor)
+
     def _on_waypoints(self, msg):
         """Store waypoints from ground control (first call only).
 
@@ -359,6 +391,16 @@ class WaypointNode(Node):
         msg.header.frame_id = 'map'
         msg.pose            = pose.pose
         self.vision_pose_pub.publish(msg)
+
+        if self.log_euler:
+            q = pose.pose.orientation
+            rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [q.x, q.y, q.z, q.w]))
+            msg_v = Vector3Stamped()
+            msg_v.header.stamp = msg.header.stamp
+            msg_v.vector.x, msg_v.vector.y, msg_v.vector.z = \
+                float(rpy[0]), float(rpy[1]), float(rpy[2])
+            self._pub_vision_rpy.publish(msg_v)
 
     # ━━ Setpoint publishing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

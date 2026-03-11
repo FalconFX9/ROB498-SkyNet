@@ -53,6 +53,7 @@ def _resolve_params(context):
                 'vicon_yaw_offset':     float(LaunchConfiguration('vicon_yaw_offset').perform(context)),
                 't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
                 'reach_radius':         0.4,
+                'log_euler':            LaunchConfiguration('log_euler'),
             }],
         ),
     ]
@@ -93,6 +94,11 @@ def generate_launch_description():
             'vicon_yaw_offset',
             default_value='0.0',
             description='Vicon rigid body yaw correction in radians (positive=CCW)',
+        ),
+        DeclareLaunchArgument(
+            'log_euler',
+            default_value='false',
+            description='Log yaw/pitch/roll of pose topics at ~2 Hz',
         ),
 
         # ── Hardware layer ────────────────────────────────────────────
@@ -144,6 +150,7 @@ def generate_launch_description():
                 'publish_rate':      30.0,
                 'publish_tf':        True,
                 'publish_to_mavros': False,
+                'log_euler':         LaunchConfiguration('log_euler'),
             }],
         ),
 

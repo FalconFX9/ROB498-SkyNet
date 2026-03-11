@@ -29,3 +29,4 @@
       - 'rally'
       - 'log_transfer'
       - 'onboard_computer_status'
+      - 'odometry'

@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, qos_profile_system_default
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Vector3Stamped
 from tf2_ros import TransformBroadcaster
 import numpy as np
 import tf_transformations
@@ -46,6 +46,7 @@ class T265PoseNode(Node):
         self.declare_parameter('camera_position_x', 0.0)  # Camera offset from drone center
         self.declare_parameter('camera_position_y', 0.0)
         self.declare_parameter('camera_position_z', 0.0)
+        self.declare_parameter('log_euler', False)       # Log RPY at ~2 Hz
 
         # Get parameters
         self.publish_tf = self.get_parameter('publish_tf').value
@@ -67,10 +68,25 @@ class T265PoseNode(Node):
             ])
         )
 
+        self.log_euler = self.get_parameter('log_euler').value
+        self._euler_log_counter = 0
+
+        # Debug RPY publishers (created only when log_euler is enabled)
+        if self.log_euler:
+            self._pub_t265_raw_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/t265_raw_rpy', 10)
+            self._pub_t265_enu_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/t265_enu_rpy', 10)
+
         # State
         self.current_pose = None
         self.initial_pose = None  # For zeroing position at start
         self.pose_initialized = False
+
+        # Orientation zeroing: collect samples then compute inverse
+        self._orient_samples = []          # list of [x, y, z, w] quaternions
+        self._orient_sample_count = 100    # ~0.5 s at 200 Hz
+        self._q_orient_zero_inv = None     # inverse of initial ENU orientation
 
         # TF broadcaster
         if self.publish_tf:
@@ -126,14 +142,34 @@ class T265PoseNode(Node):
             return  # Skip invalid pose silently
         orientation = orientation / quat_norm  # Normalize
 
-        # Store initial pose for zeroing (only after first valid pose)
+        # Collect initial samples to zero position and orientation
         if not self.pose_initialized:
-            self.initial_pose = {
-                'position': position.copy(),
-                'orientation': orientation.copy()
-            }
+            if self.initial_pose is None:
+                self.initial_pose = {
+                    'position': position.copy(),
+                    'orientation': orientation.copy()
+                }
+            self._orient_samples.append(orientation.copy())
+            if len(self._orient_samples) < self._orient_sample_count:
+                return  # Keep collecting
+            # Average the collected quaternions and compute ENU inverse
+            avg_q = self._average_quaternions(self._orient_samples)
+            # Transform the averaged raw orientation to ENU
+            avg_enu = tf_transformations.quaternion_multiply(
+                self._q_t265_to_enu, avg_q)
+            # Negate yaw (same as in transform_t265_to_drone)
+            r, p, y = tf_transformations.euler_from_quaternion(avg_enu)
+            avg_enu = tf_transformations.quaternion_from_euler(r, p, -y)
+            # Store the conjugate (inverse) to zero future orientations
+            self._q_orient_zero_inv = tf_transformations.quaternion_conjugate(avg_enu)
             self.pose_initialized = True
-            self.get_logger().info('Initial pose captured - zeroing position')
+            rpy_deg = np.degrees([r, p, -y])
+            self.get_logger().info(
+                f'Initial pose captured ({len(self._orient_samples)} samples) — '
+                f'zeroing position and orientation '
+                f'(initial ENU RPY: {rpy_deg[0]:.1f}, {rpy_deg[1]:.1f}, {rpy_deg[2]:.1f})'
+            )
+            self._orient_samples = []  # Free memory
 
         # Transform from T265 frame to ENU
         transformed_pose = self.transform_t265_to_drone(position, orientation)
@@ -146,6 +182,40 @@ class T265PoseNode(Node):
             'orientation': transformed_pose['orientation'],
             'header': msg.header
         }
+
+        # Publish debug RPY (~10 Hz from ~200 Hz callback)
+        if self.log_euler:
+            self._euler_log_counter += 1
+            if self._euler_log_counter % 20 == 0:
+                stamp = self.get_clock().now().to_msg()
+                raw_rpy = np.degrees(tf_transformations.euler_from_quaternion(orientation))
+                out_rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                    transformed_pose['orientation']))
+
+                msg_raw = Vector3Stamped()
+                msg_raw.header.stamp = stamp
+                msg_raw.vector.x, msg_raw.vector.y, msg_raw.vector.z = \
+                    float(raw_rpy[0]), float(raw_rpy[1]), float(raw_rpy[2])
+                self._pub_t265_raw_rpy.publish(msg_raw)
+
+                msg_enu = Vector3Stamped()
+                msg_enu.header.stamp = stamp
+                msg_enu.vector.x, msg_enu.vector.y, msg_enu.vector.z = \
+                    float(out_rpy[0]), float(out_rpy[1]), float(out_rpy[2])
+                self._pub_t265_enu_rpy.publish(msg_enu)
+
+    @staticmethod
+    def _average_quaternions(quats):
+        """Average quaternions using eigenvector method (Markley et al.)."""
+        Q = np.array(quats)  # Nx4, [x, y, z, w]
+        # Ensure all quaternions are in the same hemisphere
+        for i in range(1, len(Q)):
+            if np.dot(Q[i], Q[0]) < 0:
+                Q[i] = -Q[i]
+        M = Q.T @ Q  # 4x4
+        eigenvalues, eigenvectors = np.linalg.eigh(M)
+        avg = eigenvectors[:, -1]  # Largest eigenvalue
+        return avg / np.linalg.norm(avg)
 
     def transform_t265_to_drone(self, position, orientation):
         """Transform T265 pose to ENU frame for MAVROS."""
@@ -161,6 +231,16 @@ class T265PoseNode(Node):
         transformed_orientation = tf_transformations.quaternion_multiply(
             self._q_t265_to_enu, orientation
         )
+
+        # Negate yaw (flip yaw direction while preserving roll/pitch)
+        r, p, y = tf_transformations.euler_from_quaternion(transformed_orientation)
+        transformed_orientation = tf_transformations.quaternion_from_euler(r, p, -y)
+
+        # Zero orientation relative to initial pose
+        if self._q_orient_zero_inv is not None:
+            transformed_orientation = tf_transformations.quaternion_multiply(
+                self._q_orient_zero_inv, transformed_orientation
+            )
 
         return {
             'position': transformed_position,
