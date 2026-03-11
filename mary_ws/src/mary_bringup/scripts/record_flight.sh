@@ -6,7 +6,7 @@
 #   ./record_flight.sh flight_test_2.launch.py [ros2 launch args...]
 #   ./record_flight.sh flight_test_3.launch.py part:=1
 #
-# Logs are saved to: ~/mary_logs/flight_YYYYMMDD_HHMMSS/
+# Logs are saved to: <repo_root>/logs/flight_YYYYMMDD_HHMMSS/
 #   console.log      — full stdout/stderr of the launch
 #   vision_pose.csv  — /mavros/vision_pose/pose data (via pose_logger_node)
 
@@ -15,7 +15,11 @@ set -e
 LAUNCH_FILE="${1:?Usage: $0 <launch_file.py> [args...]}"
 shift
 
-LOG_BASE="$HOME/mary_logs"
+# Resolve repo root from this script's location (scripts/ → mary_bringup/ → src/ → mary_ws/ → repo)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+
+LOG_BASE="$REPO_ROOT/logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="$LOG_BASE/flight_$TIMESTAMP"
 
