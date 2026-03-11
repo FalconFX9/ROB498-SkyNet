@@ -38,6 +38,7 @@ rosbag*/
 # Logs
 *.log
 log/
+logs/
 
 # Temporary files
 *.tmp
