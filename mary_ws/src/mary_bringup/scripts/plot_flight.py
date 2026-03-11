@@ -74,7 +74,11 @@ def plot(npy_path):
     cbar.set_label('Time (normalized)')
 
     plt.tight_layout()
-    plt.show()
+
+    out_path = os.path.join(os.path.dirname(npy_path), 'flight_path.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'Saved: {out_path}')
 
 
 if __name__ == '__main__':
