@@ -278,7 +278,7 @@ class WaypointNode(Node):
             waypoint_poses = poses
 
         self.waypoints = np.array([
-            [p.position.x, p.position.y, p.position.z] for p in waypoint_poses
+            [p.position.y, p.position.x, p.position.z] for p in waypoint_poses
         ])
         self.get_logger().info(
             f'Received {len(self.waypoints)} waypoints:\n{self.waypoints}'

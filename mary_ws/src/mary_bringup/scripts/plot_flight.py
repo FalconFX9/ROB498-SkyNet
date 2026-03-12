@@ -12,6 +12,8 @@ import sys
 import os
 import glob
 
+import matplotlib
+matplotlib.use('Agg')  # headless — no display needed, saves to PNG
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -69,6 +71,14 @@ def plot(npy_path):
         f'{len(xs)} samples  ·  {duration:.1f} s'
     )
     ax.legend()
+
+    # Equal aspect ratio on all axes
+    all_vals = np.concatenate([xs, ys, zs])
+    mid = (all_vals.max() + all_vals.min()) / 2
+    half = (all_vals.max() - all_vals.min()) / 2 or 0.5
+    ax.set_xlim(mid - half, mid + half)
+    ax.set_ylim(mid - half, mid + half)
+    ax.set_zlim(mid - half, mid + half)
 
     cbar = plt.colorbar(sc, ax=ax, pad=0.1, shrink=0.6)
     cbar.set_label('Time (normalized)')
