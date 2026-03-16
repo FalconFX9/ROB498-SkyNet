@@ -14,7 +14,7 @@ class JetsonCameraNode(Node):
         # 2. nvvidconv: Scales to 640x480 AND converts to RGBA on the GPU (VIC engine)
         # 3. appsink: Hands off the hardware-converted frame to Python
         gst_pipeline = (
-            "nvarguscamerasrc sensor-id=0 ! "
+            "nvarguscamerasrc sensor-id=0 sensor-mode=4 ! "
             "video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! "
             "nvvidconv ! "
             "video/x-raw, width=640, height=480, format=RGBA ! "

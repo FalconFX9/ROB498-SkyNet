@@ -178,12 +178,14 @@ class StereoDepthNode(Node):
         D_left = np.array(ci_l.d[:4])
         D_right = np.array(ci_r.d[:4])
 
-        # Extrinsics: T265 factory-calibrated values (from tf2_echo / EEPROM).
-        # tf2 Buffer in Foxy doesn't reliably receive static transforms from
-        # the realsense driver, so we use known T265 geometry directly.
-        # Fisheye1 → Fisheye2: ~64mm baseline along X, near-identity rotation.
-        T = np.array([0.064, -0.001, -0.001])
-        R = self._quat_to_rotation(0.000, 0.004, 0.001, 1.000)
+        # Extrinsics: T265 factory-calibrated values from pyrealsense2 EEPROM.
+        # (printed by scripts/print_calibration.py — matches realsense_test.py)
+        T = np.array([-0.06430789083242416, 7.151146564865485e-05, -0.00014938200183678418])
+        R = np.array([
+            [ 0.9999712705612183,  0.0010891810525208712, -0.007505698595196009],
+            [-0.0010844767093658447, 0.9999992251396179,   0.0006306868162937462],
+            [ 0.007506378460675478, -0.0006225303513929248, 0.9999716281890869],
+        ])
 
         self.baseline = np.linalg.norm(T)
         self.get_logger().info(f'Stereo baseline: {self.baseline * 1000:.1f} mm (T265 factory)')
