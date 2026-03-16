@@ -259,7 +259,7 @@ class T265PoseNode(Node):
 
         pose_msg.pose.position.x = float(self.current_pose['position'][0])
         pose_msg.pose.position.y = float(self.current_pose['position'][1])
-        pose_msg.pose.position.z = float(self.current_pose['position'][2])
+        pose_msg.pose.position.z = max(0.0, float(self.current_pose['position'][2]))
 
         pose_msg.pose.orientation.x = float(self.current_pose['orientation'][0])
         pose_msg.pose.orientation.y = float(self.current_pose['orientation'][1])
