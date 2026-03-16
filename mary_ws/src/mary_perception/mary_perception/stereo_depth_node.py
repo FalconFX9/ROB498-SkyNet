@@ -26,7 +26,6 @@ from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
 import message_filters
-import tf2_ros
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +105,6 @@ class StereoDepthNode(Node):
         # Camera info received flags
         self._ci_left = None          # CameraInfo
         self._ci_right = None
-        self._extrinsics = None       # (R, T) from tf2
-
-        # ── tf2 ───────────────────────────────────────────────────────
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ── QoS ───────────────────────────────────────────────────────
         sensor_qos = QoSProfile(
@@ -168,38 +162,13 @@ class StereoDepthNode(Node):
     # One-shot calibration (mirrors realsense_test.py Phase 2)
     # ------------------------------------------------------------------
     def _try_calibrate(self):
-        """Attempt calibration once both camera_info msgs and tf extrinsics are available."""
+        """Attempt calibration once both camera_info msgs are available."""
         if self.calibrated or self._ci_left is None or self._ci_right is None:
             return
+        self._finish_calibration()
 
-        # --- Extrinsics via tf2 ---
-        # realsense2_camera publishes static tf between these frames
-        left_frame = self._ci_left.header.frame_id
-        right_frame = self._ci_right.header.frame_id
-        if not left_frame or not right_frame:
-            left_frame = 'camera_fisheye1_optical_frame'
-            right_frame = 'camera_fisheye2_optical_frame'
-
-        try:
-            tf_msg = self.tf_buffer.lookup_transform(
-                left_frame, right_frame, rclpy.time.Time())
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
-            self.get_logger().warn(f'Waiting for tf {left_frame} → {right_frame}: {e}')
-            # Retry on next camera_info or via a one-shot timer
-            self.create_timer(1.0, self._retry_calibrate)
-            return
-
-        self._finish_calibration(tf_msg)
-
-    def _retry_calibrate(self):
-        """Timer callback to retry calibration if tf wasn't ready."""
-        if self.calibrated:
-            return
-        self._try_calibrate()
-
-    def _finish_calibration(self, tf_msg):
-        """Compute rectification maps from camera_info + tf extrinsics."""
+    def _finish_calibration(self):
+        """Compute rectification maps from camera_info + T265 extrinsics."""
         ci_l, ci_r = self._ci_left, self._ci_right
         w, h = ci_l.width, ci_l.height
 
@@ -209,16 +178,15 @@ class StereoDepthNode(Node):
         D_left = np.array(ci_l.d[:4])
         D_right = np.array(ci_r.d[:4])
 
-        # Extrinsics from tf (left → right)
-        t = tf_msg.transform.translation
-        q = tf_msg.transform.rotation
-        T = np.array([t.x, t.y, t.z])
-
-        # Quaternion → rotation matrix (x, y, z, w)
-        R = self._quat_to_rotation(q.x, q.y, q.z, q.w)
+        # Extrinsics: T265 factory-calibrated values (from tf2_echo / EEPROM).
+        # tf2 Buffer in Foxy doesn't reliably receive static transforms from
+        # the realsense driver, so we use known T265 geometry directly.
+        # Fisheye1 → Fisheye2: ~64mm baseline along X, near-identity rotation.
+        T = np.array([0.064, -0.001, -0.001])
+        R = self._quat_to_rotation(0.000, 0.004, 0.001, 1.000)
 
         self.baseline = np.linalg.norm(T)
-        self.get_logger().info(f'Stereo baseline: {self.baseline * 1000:.1f} mm')
+        self.get_logger().info(f'Stereo baseline: {self.baseline * 1000:.1f} mm (T265 factory)')
 
         # Stereo rectification
         R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(

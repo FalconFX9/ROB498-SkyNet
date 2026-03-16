@@ -164,16 +164,36 @@ ros2 launch mary_bringup flight_test_3.launch.py part:=2 t265_z_offset:=0.1234
 
 ## MARY System (Person Following) — Status
 
-Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package, `comm_node.py`, `mission_manager_node.py`, `sensors.launch.py`, `mary_full.launch.py`, `mary_params.yaml`.
+Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package, `comm_node.py`, `mission_manager_node.py`, `sensors.launch.py`, `mary_full.launch.py`, `mary_params.yaml`, `person_tracker_node.py`, `altitude_controller_node.py`.
 
-Remaining nodes to build on:
+### Implemented Nodes (2026-03-16, untested)
 
-- **`follower_node.py`** — P-control person-following stub (untested). Will evolve from `waypoint_node.py` patterns.
-- **`altitude_controller_node.py`** — PID altitude hold stub (untested).
-- **`person_tracker_node.py`** — **INCOMPLETE.** Has subscriber/publisher structure but all processing functions are TODO stubs.
-- **`stereo_depth_node.py`** — **NEW (2026-03-16).** ROS2 integration of the VPI stereo disparity pipeline from `scripts/realsense_test.py`. Subscribes to T265 fisheye image topics (no pyrealsense2 needed), gets calibration from `camera_info` + tf2 extrinsics, runs VPI/CUDA stereo on GPU. Publishes `/mary/depth/disparity` (mono16 Q10.5), `/mary/depth/depth` (32FC1 metres), `/mary/depth/debug` (colorised). Next step: build blob-detection tracking on top of disparity output.
+- **`stereo_tracker_node.py`** (mary_perception) — Combines VPI GPU stereo disparity with blob detection. Subscribes to T265 fisheye stereo pair, computes depth via `libstereo.so` (VPI/CUDA), thresholds depth to a configurable band (0.5–2.5m), finds largest blob via contour detection, converts centroid + depth to 3D body-frame offset, applies EMA filter. Publishes `/mary/tracking/target` (PointStamped, body frame), `/mary/tracking/status` (TRACKING/LOST), `/mary/tracking/debug` (colorized depth + overlay). Axis signs are configurable parameters for mounting calibration.
 
-**Plan:** Two new functional nodes needed — (1) stereo tracker node (disparity blob detection → target PointStamped), (2) follower node (target → MAVROS setpoints with Kalman velocity estimation). Mode switching (acquisition/tracking/recovery) lives inside follower.
+- **`follower_node.py`** (mary_control) — Rewritten from scratch based on `waypoint_node.py` patterns. State machine: IDLE → LAUNCH → FOLLOW ↔ HOVER → LAND | ABORT. Subscribes to `/mary/tracking/target` and `/mary/tracking/status`. Converts body-frame tracking offset to world-frame setpoint using drone yaw. Rate-limits horizontal movement (1.5 m/s). On tracking loss, enters HOVER holding last known target; auto-lands after configurable timeout (default 3s). Same MAVROS integration as waypoint_node: vision pose relay, 20Hz setpoints, RC override detection, course service interface.
+
+- **`stereo_depth_node.py`** (mary_perception) — Standalone depth publisher (kept for debugging/testing). Not used by the demo pipeline.
+
+- **`mary_demo.launch.py`** (mary_bringup) — Launch file for full person-following demo. Launches MAVROS + T265 + t265_pose_node + stereo_tracker_node + follower_node. Supports part:=1 (Vicon) and part:=2 (T265 only).
+
+### Key Topics (Person Following Pipeline)
+
+```
+T265 fisheye L/R -> stereo_tracker_node -> /mary/tracking/target (PointStamped)
+                         |                         |
+                         +-> /mary/tracking/debug   v
+                                              follower_node -> /mavros/setpoint_position/local
+T265 pose -> t265_pose_node -> /mary/localization/pose --+         |
+                                                                    v
+                                                         /mavros/vision_pose/pose
+```
+
+### Next Steps
+
+1. Test stereo_tracker_node standalone with T265 plugged in (verify blob detection)
+2. Test follower_node in simulation or tethered flight
+3. Calibrate axis_sign_x / axis_sign_y parameters for T265 mounting
+4. Tune depth_min/depth_max, ema_alpha, hover_timeout for demo conditions
 
 ---
 
@@ -201,17 +221,17 @@ ROB498-SkyNet/
 │   ├── mary_bringup/
 │   │   └── launch/
 │   │       ├── flight_test_2.launch.py    # FT2 launcher (working)
-│   │       └── flight_test_3.launch.py    # FT3 launcher (working)
+│   │       ├── flight_test_3.launch.py    # FT3 launcher (working)
+│   │       └── mary_demo.launch.py        # Person following demo launcher
 │   ├── mary_control/mary_control/
 │   │   ├── stationkeeping_node.py         # FT2 controller (working)
 │   │   ├── waypoint_node.py              # FT3 controller (working)
-│   │   ├── follower_node.py               # Person following (untested stub)
-│   │   └── altitude_controller_node.py    # PID altitude (untested stub)
+│   │   └── follower_node.py               # Person following controller
 │   ├── mary_perception/mary_perception/
 │   │   ├── t265_pose_node.py              # T265 VIO (working)
-│   │   ├── stereo_depth_node.py           # VPI stereo depth from T265 fisheye (new)
-│   │   ├── pose_logger_node.py            # Pose logging (working, optional)
-│   │   └── person_tracker_node.py         # Person detection (INCOMPLETE)
+│   │   ├── stereo_tracker_node.py         # VPI stereo + blob tracking
+│   │   ├── stereo_depth_node.py           # Standalone depth publisher (debug)
+│   │   └── pose_logger_node.py            # Pose logging (working, optional)
 │   └── mary_hardware/
 │       ├── launch/
 │       │   └── mavros.launch.py           # MAVROS FCU bridge

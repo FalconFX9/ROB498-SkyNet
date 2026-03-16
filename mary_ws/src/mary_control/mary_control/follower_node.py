@@ -1,265 +1,666 @@
 #!/usr/bin/env python3
 """
 Person Follower Node for MARY Drone
-Generates velocity commands to follow a detected person while maintaining
-the umbrella position above their head.
+
+Follows a tracked target using position setpoints.  Built on the proven
+waypoint_node.py patterns (FT2/FT3) with tracking-specific logic.
+
+Flight state machine:
+    IDLE  ->  LAUNCH  ->  FOLLOW  <->  HOVER  ->  LAND  |  ABORT
+
+The stereo_tracker_node publishes the target's 3D offset in body frame.
+This node converts that to world-frame position setpoints for MAVROS.
+
+Course interface (service servers):
+    {drone_id}/comm/launch  (Trigger) -- Arm, OFFBOARD, ascend
+    {drone_id}/comm/test    (Trigger) -- Begin following (kept as "test"
+                                         for course interface compat)
+    {drone_id}/comm/land    (Trigger) -- Smooth descent
+    {drone_id}/comm/abort   (Trigger) -- Emergency disarm
 """
+
+import numpy as np
+import tf_transformations
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
-from geometry_msgs.msg import PoseStamped, PointStamped, TwistStamped, Vector3Stamped
-from std_msgs.msg import Bool
-from nav_msgs.msg import Odometry
-import numpy as np
+
+from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
+from mavros_msgs.msg import State
+from mavros_msgs.srv import CommandBool, SetMode
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 
 class FollowerNode(Node):
-    """
-    Controls drone to follow a detected person.
-
-    Subscriptions:
-        /mary/perception/person_position (geometry_msgs/PointStamped): Person position in camera frame
-        /mary/perception/person_velocity (geometry_msgs/Vector3Stamped): Person velocity estimate
-        /mary/perception/person_detected (std_msgs/Bool): Detection status
-        /mary/localization/pose (geometry_msgs/PoseStamped): Current drone pose (altitude via pose.position.z)
-
-    Publications:
-        /mavros/setpoint_velocity/cmd_vel (geometry_msgs/TwistStamped): Velocity commands
-        /mary/control/target_position (geometry_msgs/PoseStamped): Target position for debugging
-    """
-
-    # Control modes
-    MODE_IDLE = 0
-    MODE_SEARCH = 1
-    MODE_FOLLOW = 2
-    MODE_HOVER = 3
+    """Position-setpoint follower controller for MARY person tracking."""
 
     def __init__(self):
-        super().__init__('follower_node')
+        # Course skeleton requires node name = drone_id
+        super().__init__('rob498_drone_10')
 
-        # Parameters
-        self.declare_parameter('target_altitude', 2.5)       # meters above person
-        self.declare_parameter('follow_distance', 0.0)       # horizontal offset (0 = directly above)
-        self.declare_parameter('max_horizontal_speed', 2.0)  # m/s
-        self.declare_parameter('max_vertical_speed', 1.0)    # m/s
-        self.declare_parameter('position_p_gain', 1.0)       # Proportional gain
-        self.declare_parameter('velocity_ff_gain', 0.8)      # Velocity feedforward gain
-        self.declare_parameter('detection_timeout', 2.0)     # seconds before switching to search
-        self.declare_parameter('control_rate', 20.0)         # Hz
+        # -- Parameters -------------------------------------------------------
+        self.declare_parameter('drone_id',              'rob498_drone_10')
+        self.declare_parameter('takeoff_altitude',      1.5)      # m
+        self.declare_parameter('target_altitude_above', 1.0)      # m above person
+        self.declare_parameter('setpoint_rate',         20.0)     # Hz
+        self.declare_parameter('vision_pose_rate',      30.0)     # Hz
+        self.declare_parameter('descent_speed',         0.15)     # m/s
+        self.declare_parameter('offboard_wait',         1.5)      # s
+        self.declare_parameter('mode_request_interval', 2.0)      # s
+        self.declare_parameter('vicon_topic',           '')
+        self.declare_parameter('vicon_timeout',         0.5)      # s
+        self.declare_parameter('vicon_yaw_offset',      0.0)      # rad
+        self.declare_parameter('t265_z_offset',         0.0)      # m
+        self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
+        self.declare_parameter('max_follow_speed',      1.5)      # m/s rate limit
+        self.declare_parameter('log_euler',             False)
 
-        # Get parameters
-        self.target_altitude = self.get_parameter('target_altitude').value
-        self.max_h_speed = self.get_parameter('max_horizontal_speed').value
-        self.max_v_speed = self.get_parameter('max_vertical_speed').value
-        self.p_gain = self.get_parameter('position_p_gain').value
-        self.ff_gain = self.get_parameter('velocity_ff_gain').value
-        self.detection_timeout = self.get_parameter('detection_timeout').value
-        self.control_rate = self.get_parameter('control_rate').value
+        drone_id               = self.get_parameter('drone_id').value
+        self.takeoff_altitude  = self.get_parameter('takeoff_altitude').value
+        self.target_alt_above  = self.get_parameter('target_altitude_above').value
+        setpoint_rate          = self.get_parameter('setpoint_rate').value
+        vision_rate            = self.get_parameter('vision_pose_rate').value
+        self.descent_speed     = self.get_parameter('descent_speed').value
+        self.offboard_wait     = self.get_parameter('offboard_wait').value
+        self.mode_req_interval = self.get_parameter('mode_request_interval').value
+        vicon_topic            = self.get_parameter('vicon_topic').value
+        self.vicon_timeout     = self.get_parameter('vicon_timeout').value
+        self.vicon_yaw_offset  = self.get_parameter('vicon_yaw_offset').value
+        self.t265_z_offset     = self.get_parameter('t265_z_offset').value
+        self.hover_timeout     = self.get_parameter('hover_timeout').value
+        self.max_follow_speed  = self.get_parameter('max_follow_speed').value
+        self.log_euler         = self.get_parameter('log_euler').value
 
-        # State variables
-        self.mode = self.MODE_IDLE
-        self.person_detected = False
-        self.last_detection_time = None
-        self.person_position = None      # In camera/world frame
-        self.person_velocity = None      # Estimated velocity
-        self.drone_pose = None           # Current drone pose
-        self.current_altitude = None     # T265 altitude (pose.position.z)
+        # Debug RPY publishers
+        if self.log_euler:
+            self._pub_vicon_raw_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vicon_raw_rpy', 10)
+            self._pub_vicon_cor_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vicon_cor_rpy', 10)
+            self._pub_vision_rpy = self.create_publisher(
+                Vector3Stamped, '/mary/debug/vision_rpy', 10)
 
-        # Subscribers
-        self.person_pos_sub = self.create_subscription(
-            PointStamped,
-            '/mary/perception/person_position',
-            self.person_position_callback,
-            10
+        # -- Flight state -----------------------------------------------------
+        self.flight_state       = 'IDLE'
+        self.mavros_state       = None
+        self.hover_pose         = None       # PoseStamped
+        self.t265_pose          = None
+        self.t265_stamp         = None
+        self.vicon_pose         = None
+        self.vicon_stamp        = None
+        self.launch_time        = None
+        self.land_start_time    = None
+        self.land_start_alt     = None
+        self.last_mode_req_time = None
+        self.last_arm_req_time  = None
+        self._hover_logged      = False
+        self._offboard_achieved = False
+        self._raw_t265_z        = None
+
+        # -- Tracking state ---------------------------------------------------
+        self.tracking_offset    = None       # latest PointStamped from tracker
+        self.tracking_status    = 'LOST'
+        self.hover_start_time   = None       # when HOVER was entered
+        self.follow_target      = None       # PoseStamped in world frame
+        self.last_good_target   = None       # last valid target for HOVER hold
+
+        # -- Vicon body-frame correction (same as waypoint_node) ---------------
+        self.use_vicon = bool(vicon_topic)
+        R_body = np.array([
+            [ 0,  0, -1],
+            [ 0, -1,  0],
+            [-1,  0,  0],
+        ])
+        self._q_vicon_body_correction = tf_transformations.quaternion_from_matrix(
+            np.vstack([
+                np.hstack([R_body, np.zeros((3, 1))]),
+                [0, 0, 0, 1],
+            ])
         )
-        self.person_vel_sub = self.create_subscription(
-            Vector3Stamped,
-            '/mary/perception/person_velocity',
-            self.person_velocity_callback,
-            10
-        )
-        self.person_detected_sub = self.create_subscription(
-            Bool,
-            '/mary/perception/person_detected',
-            self.person_detected_callback,
-            10
-        )
-        self.pose_sub = self.create_subscription(
-            PoseStamped,
-            '/mary/localization/pose',
-            self.pose_callback,
-            qos_profile_system_default
-        )
-        # Publishers
-        self.vel_pub = self.create_publisher(
-            TwistStamped,
-            '/mavros/setpoint_velocity/cmd_vel',
-            qos_profile_system_default
-        )
-        self.target_pub = self.create_publisher(
-            PoseStamped,
-            '/mary/control/target_position',
-            10
-        )
+        if self.vicon_yaw_offset != 0.0:
+            q_yaw = tf_transformations.quaternion_from_euler(
+                0.0, 0.0, self.vicon_yaw_offset)
+            self._q_vicon_body_correction = \
+                tf_transformations.quaternion_multiply(
+                    q_yaw, self._q_vicon_body_correction)
+            self.get_logger().info(
+                f'Vicon body correction + yaw trim '
+                f'{np.degrees(self.vicon_yaw_offset):.1f} deg')
+        else:
+            self.get_logger().info('Vicon body-frame correction active')
 
-        # Control timer
-        self.create_timer(1.0 / self.control_rate, self.control_loop)
+        # -- Subscribers ------------------------------------------------------
+        self.create_subscription(
+            State, '/mavros/state',
+            self._on_mavros_state, qos_profile_system_default)
+        self.create_subscription(
+            PoseStamped, '/mary/localization/pose',
+            self._on_t265_pose, qos_profile_system_default)
 
-        self.get_logger().info('Follower Node initialized')
-        self.get_logger().info(f'  Target altitude: {self.target_altitude}m')
-        self.get_logger().info(f'  Max speeds: H={self.max_h_speed}m/s, V={self.max_v_speed}m/s')
+        if vicon_topic:
+            self.create_subscription(
+                PoseStamped, vicon_topic, self._on_vicon_pose, 10)
+            self.get_logger().info(f'VICON topic: {vicon_topic}')
+        else:
+            self.get_logger().info('No VICON -- T265 only')
 
-    def person_position_callback(self, msg: PointStamped):
-        """Update person position."""
-        self.person_position = np.array([msg.point.x, msg.point.y, msg.point.z])
+        # Tracking input
+        self.create_subscription(
+            PointStamped, '/mary/tracking/target',
+            self._on_tracking_target, 10)
+        self.create_subscription(
+            String, '/mary/tracking/status',
+            self._on_tracking_status, 10)
 
-    def person_velocity_callback(self, msg: Vector3Stamped):
-        """Update person velocity estimate."""
-        self.person_velocity = np.array([msg.vector.x, msg.vector.y, msg.vector.z])
+        # -- Publishers -------------------------------------------------------
+        self.vision_pose_pub = self.create_publisher(
+            PoseStamped, '/mavros/vision_pose/pose',
+            qos_profile_system_default)
+        self.setpoint_pub = self.create_publisher(
+            PoseStamped, '/mavros/setpoint_position/local',
+            qos_profile_system_default)
+        self.state_pub = self.create_publisher(
+            String, '/mary/comm/flight_state', 10)
 
-    def person_detected_callback(self, msg: Bool):
-        """Update detection status."""
-        self.person_detected = msg.data
-        if self.person_detected:
-            self.last_detection_time = self.get_clock().now()
+        # -- MAVROS service clients -------------------------------------------
+        self.arming_client   = self.create_client(
+            CommandBool, '/mavros/cmd/arming')
+        self.set_mode_client = self.create_client(
+            SetMode, '/mavros/set_mode')
 
-    def pose_callback(self, msg: PoseStamped):
-        """Update current drone pose and extract altitude from T265."""
-        self.drone_pose = msg
-        self.current_altitude = msg.pose.position.z
+        # -- Course service servers -------------------------------------------
+        self.create_service(
+            Trigger, f'{drone_id}/comm/launch', self._handle_launch)
+        self.create_service(
+            Trigger, f'{drone_id}/comm/test',   self._handle_test)
+        self.create_service(
+            Trigger, f'{drone_id}/comm/land',   self._handle_land)
+        self.create_service(
+            Trigger, f'{drone_id}/comm/abort',  self._handle_abort)
 
-    def control_loop(self):
-        """Main control loop - runs at control_rate Hz."""
-        # Update mode based on detection status
-        self.update_mode()
+        # -- Timers -----------------------------------------------------------
+        self.create_timer(1.0 / setpoint_rate, self._setpoint_loop)
+        self.create_timer(1.0 / vision_rate,   self._vision_pose_loop)
+        self.create_timer(0.1,                 self._state_machine_loop)
 
-        # Generate velocity command based on mode
-        vel_cmd = TwistStamped()
-        vel_cmd.header.stamp = self.get_clock().now().to_msg()
-        vel_cmd.header.frame_id = 'base_link'
+        self.get_logger().info(
+            f'FollowerNode ready  drone_id={drone_id}  '
+            f'altitude={self.takeoff_altitude}m  '
+            f'target_above={self.target_alt_above}m  '
+            f'setpoint={setpoint_rate}Hz  vision={vision_rate}Hz')
 
-        if self.mode == self.MODE_FOLLOW:
-            vel_cmd = self.compute_follow_velocity()
-        elif self.mode == self.MODE_SEARCH:
-            vel_cmd = self.compute_search_velocity()
-        elif self.mode == self.MODE_HOVER:
-            vel_cmd = self.compute_hover_velocity()
-        # MODE_IDLE: zero velocity (already initialized)
+    # == Subscriber callbacks ================================================
 
-        self.vel_pub.publish(vel_cmd)
+    def _on_mavros_state(self, msg):
+        self.mavros_state = msg
 
-    def update_mode(self):
-        """Update control mode based on system state."""
-        current_time = self.get_clock().now()
+    def _on_t265_pose(self, msg):
+        self._raw_t265_z = msg.pose.position.z
+        msg.pose.position.z += self.t265_z_offset
+        self.t265_pose  = msg
+        self.t265_stamp = self.get_clock().now()
 
-        if self.mode == self.MODE_IDLE:
-            # Stay idle until explicitly activated
-            pass
+    def _on_vicon_pose(self, msg):
+        quat = np.array([
+            msg.pose.orientation.x, msg.pose.orientation.y,
+            msg.pose.orientation.z, msg.pose.orientation.w,
+        ])
+        corrected = tf_transformations.quaternion_multiply(
+            self._q_vicon_body_correction, quat)
 
-        elif self.person_detected:
-            self.mode = self.MODE_FOLLOW
+        transformed = PoseStamped()
+        transformed.header             = msg.header
+        transformed.pose.position      = msg.pose.position
+        transformed.pose.orientation.x = float(corrected[0])
+        transformed.pose.orientation.y = float(corrected[1])
+        transformed.pose.orientation.z = float(corrected[2])
+        transformed.pose.orientation.w = float(corrected[3])
 
-        elif self.last_detection_time is not None:
-            # Check for detection timeout
-            time_since_detection = (current_time - self.last_detection_time).nanoseconds * 1e-9
-            if time_since_detection > self.detection_timeout:
-                self.mode = self.MODE_SEARCH
+        self.vicon_pose  = transformed
+        self.vicon_stamp = self.get_clock().now()
+
+        if self.log_euler:
+            stamp = self.get_clock().now().to_msg()
+            raw_rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [quat[0], quat[1], quat[2], quat[3]]))
+            cor_rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [corrected[0], corrected[1], corrected[2], corrected[3]]))
+
+            msg_raw = Vector3Stamped()
+            msg_raw.header.stamp = stamp
+            msg_raw.vector.x = float(raw_rpy[0])
+            msg_raw.vector.y = float(raw_rpy[1])
+            msg_raw.vector.z = float(raw_rpy[2])
+            self._pub_vicon_raw_rpy.publish(msg_raw)
+
+            msg_cor = Vector3Stamped()
+            msg_cor.header.stamp = stamp
+            msg_cor.vector.x = float(cor_rpy[0])
+            msg_cor.vector.y = float(cor_rpy[1])
+            msg_cor.vector.z = float(cor_rpy[2])
+            self._pub_vicon_cor_rpy.publish(msg_cor)
+
+    def _on_tracking_target(self, msg):
+        self.tracking_offset = msg
+
+    def _on_tracking_status(self, msg):
+        self.tracking_status = msg.data
+
+    # == Pose helpers ========================================================
+
+    def _get_active_pose(self):
+        """Return best available pose: fresh VICON > T265 > None."""
+        now = self.get_clock().now()
+        if self.vicon_pose is not None and self.vicon_stamp is not None:
+            age = (now - self.vicon_stamp).nanoseconds * 1e-9
+            if age < self.vicon_timeout:
+                return self.vicon_pose
+        return self.t265_pose
+
+    def _get_current_position(self):
+        pose = self._get_active_pose()
+        if pose is None:
+            return None
+        p = pose.pose.position
+        return np.array([p.x, p.y, p.z])
+
+    def _get_current_yaw(self):
+        pose = self._get_active_pose()
+        if pose is None:
+            return 0.0
+        q = pose.pose.orientation
+        _, _, yaw = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])
+        return yaw
+
+    # == Tracking -> world frame =============================================
+
+    def _compute_follow_target(self):
+        """Convert body-frame tracking offset to world-frame setpoint.
+
+        The stereo_tracker_node publishes (x_body, y_body, z_body) where:
+          x_body = forward offset to person
+          y_body = rightward offset to person
+          z_body = downward offset to person (negative value)
+
+        We rotate the horizontal component by drone yaw to get world-frame
+        offset, then compute a setpoint directly above the person.
+        """
+        if self.tracking_offset is None:
+            return None
+
+        pos = self._get_current_position()
+        if pos is None:
+            return None
+
+        dx_body = self.tracking_offset.point.x  # forward
+        dy_body = self.tracking_offset.point.y  # right
+        dz_body = self.tracking_offset.point.z  # down (negative)
+
+        # Rotate horizontal offset body -> world using yaw
+        yaw = self._get_current_yaw()
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+        dx_world = dx_body * cos_y - dy_body * sin_y
+        dy_world = dx_body * sin_y + dy_body * cos_y
+
+        # Person position in world frame
+        person_x = pos[0] + dx_world
+        person_y = pos[1] + dy_world
+        person_z = pos[2] + dz_body   # dz_body is negative
+
+        # Setpoint: directly above person at target altitude
+        target = PoseStamped()
+        target.pose.position.x = person_x
+        target.pose.position.y = person_y
+        target.pose.position.z = person_z + self.target_alt_above
+
+        # Preserve current heading
+        pose = self._get_active_pose()
+        if pose is not None:
+            target.pose.orientation = pose.pose.orientation
+        else:
+            target.pose.orientation.w = 1.0
+
+        return target
+
+    # == Vision pose relay ===================================================
+
+    def _vision_pose_loop(self):
+        """Relay active pose to MAVROS for PX4 EKF2 fusion."""
+        pose = self._get_active_pose()
+        if pose is None:
+            return
+        msg = PoseStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.pose            = pose.pose
+        self.vision_pose_pub.publish(msg)
+
+        if self.log_euler:
+            q = pose.pose.orientation
+            rpy = np.degrees(tf_transformations.euler_from_quaternion(
+                [q.x, q.y, q.z, q.w]))
+            msg_v = Vector3Stamped()
+            msg_v.header.stamp = msg.header.stamp
+            msg_v.vector.x = float(rpy[0])
+            msg_v.vector.y = float(rpy[1])
+            msg_v.vector.z = float(rpy[2])
+            self._pub_vision_rpy.publish(msg_v)
+
+    # == Setpoint publishing =================================================
+
+    def _setpoint_loop(self):
+        """Publish position setpoints at fixed rate.
+
+        FOLLOW  -> fly toward tracked person (rate-limited)
+        HOVER   -> hold last good target position
+        IDLE/LAUNCH -> hold hover_pose
+        LAND    -> ramp Z toward ground
+        ABORT   -> stop publishing
+        """
+        msg = PoseStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+
+        if self.flight_state == 'FOLLOW':
+            target = self._compute_follow_target()
+            if target is not None:
+                # Rate-limit horizontal position change for safety
+                pos = self._get_current_position()
+                if pos is not None:
+                    dx = target.pose.position.x - pos[0]
+                    dy = target.pose.position.y - pos[1]
+                    dist = np.sqrt(dx*dx + dy*dy)
+                    dt = 1.0 / 20.0
+                    max_step = self.max_follow_speed * dt
+                    if dist > max_step:
+                        scale = max_step / dist
+                        target.pose.position.x = pos[0] + dx * scale
+                        target.pose.position.y = pos[1] + dy * scale
+
+                self.follow_target = target
+                self.last_good_target = target
+                msg.pose = target.pose
+            elif self.last_good_target is not None:
+                msg.pose = self.last_good_target.pose
+            elif self.hover_pose is not None:
+                msg.pose = self.hover_pose.pose
             else:
-                self.mode = self.MODE_HOVER  # Brief loss - hover in place
+                self._fill_default_setpoint(msg)
 
-    def compute_follow_velocity(self) -> TwistStamped:
-        """Compute velocity to follow detected person."""
-        vel_cmd = TwistStamped()
-        vel_cmd.header.stamp = self.get_clock().now().to_msg()
-        vel_cmd.header.frame_id = 'base_link'
+        elif self.flight_state == 'HOVER':
+            if self.last_good_target is not None:
+                msg.pose = self.last_good_target.pose
+            elif self.hover_pose is not None:
+                msg.pose = self.hover_pose.pose
+            else:
+                self._fill_default_setpoint(msg)
 
-        if self.person_position is None:
-            return vel_cmd
+        elif self.flight_state in ('IDLE', 'LAUNCH'):
+            if self.hover_pose is not None:
+                msg.pose = self.hover_pose.pose
+            else:
+                self._fill_default_setpoint(msg)
 
-        # Horizontal control: center person in frame
-        # person_position.x = horizontal offset (positive = person is to the right)
-        # person_position.y = vertical offset in image (positive = person is below center)
-        error_x = -self.person_position[0]  # Negative to move toward person
-        error_y = -self.person_position[1]
+        elif self.flight_state == 'LAND':
+            if self.hover_pose is not None:
+                msg.pose.position.x    = self.hover_pose.pose.position.x
+                msg.pose.position.y    = self.hover_pose.pose.position.y
+                msg.pose.orientation.x = self.hover_pose.pose.orientation.x
+                msg.pose.orientation.y = self.hover_pose.pose.orientation.y
+                msg.pose.orientation.z = self.hover_pose.pose.orientation.z
+                msg.pose.orientation.w = self.hover_pose.pose.orientation.w
+            if self.land_start_time is not None:
+                elapsed  = (self.get_clock().now()
+                            - self.land_start_time).nanoseconds * 1e-9
+                target_z = self.land_start_alt - self.descent_speed * elapsed
+                msg.pose.position.z = max(target_z, 0.0)
+            else:
+                msg.pose.position.z = 0.0
 
-        # P control for position
-        vel_x = self.p_gain * error_x
-        vel_y = self.p_gain * error_y
+        elif self.flight_state == 'ABORT':
+            self._broadcast_state()
+            return
 
-        # Feedforward from person velocity (predictive following)
-        if self.person_velocity is not None:
-            vel_x += self.ff_gain * self.person_velocity[0]
-            vel_y += self.ff_gain * self.person_velocity[1]
+        self.setpoint_pub.publish(msg)
+        self._broadcast_state()
 
-        # Clamp horizontal velocity
-        h_speed = np.sqrt(vel_x**2 + vel_y**2)
-        if h_speed > self.max_h_speed:
-            scale = self.max_h_speed / h_speed
-            vel_x *= scale
-            vel_y *= scale
+    def _fill_default_setpoint(self, msg):
+        """Fall back to current pose or default altitude."""
+        pose = self._get_active_pose()
+        if pose is not None:
+            msg.pose = pose.pose
+        else:
+            msg.pose.position.z    = self.takeoff_altitude
+            msg.pose.orientation.w = 1.0
 
-        # Vertical control: maintain target altitude
-        vel_z = 0.0
-        if self.current_altitude is not None:
-            altitude_error = self.target_altitude - self.current_altitude
-            vel_z = self.p_gain * altitude_error
-            vel_z = np.clip(vel_z, -self.max_v_speed, self.max_v_speed)
+    def _broadcast_state(self):
+        msg      = String()
+        msg.data = self.flight_state
+        self.state_pub.publish(msg)
 
-        # Set velocity command
-        vel_cmd.twist.linear.x = float(vel_x)
-        vel_cmd.twist.linear.y = float(vel_y)
-        vel_cmd.twist.linear.z = float(vel_z)
+    # == State machine (10 Hz) ===============================================
 
-        return vel_cmd
+    def _state_machine_loop(self):
+        # RC override / external disarm detection
+        if (self._offboard_achieved
+                and self.flight_state in ('LAUNCH', 'FOLLOW', 'HOVER', 'LAND')
+                and self.mavros_state is not None):
+            if self.mavros_state.mode != 'OFFBOARD':
+                self.get_logger().info(
+                    f'RC override (mode={self.mavros_state.mode}) -- releasing')
+                self._reset_to_idle()
+                return
+            if not self.mavros_state.armed:
+                self.get_logger().info('External disarm -- resetting to IDLE')
+                self._reset_to_idle()
+                return
 
-    def compute_search_velocity(self) -> TwistStamped:
-        """Compute velocity for searching (slow rotation or pattern)."""
-        vel_cmd = TwistStamped()
-        vel_cmd.header.stamp = self.get_clock().now().to_msg()
-        vel_cmd.header.frame_id = 'base_link'
+        if self.flight_state == 'LAUNCH':
+            self._tick_launch()
+        elif self.flight_state == 'FOLLOW':
+            self._tick_follow()
+        elif self.flight_state == 'HOVER':
+            self._tick_hover()
+        elif self.flight_state == 'LAND':
+            self._tick_land()
 
-        # TODO: Implement search pattern
-        # For now, just rotate slowly to scan for person
-        vel_cmd.twist.angular.z = 0.3  # rad/s - slow yaw rotation
+    def _tick_launch(self):
+        """Request OFFBOARD + arm after setpoints have streamed."""
+        if self.mavros_state is None:
+            return
+        now     = self.get_clock().now()
+        elapsed = (now - self.launch_time).nanoseconds * 1e-9
 
-        # Maintain altitude during search
-        if self.current_altitude is not None:
-            altitude_error = self.target_altitude - self.current_altitude
-            vel_cmd.twist.linear.z = float(np.clip(
-                self.p_gain * altitude_error,
-                -self.max_v_speed,
-                self.max_v_speed
-            ))
+        if elapsed < self.offboard_wait:
+            return
 
-        return vel_cmd
+        if self.mavros_state.mode != 'OFFBOARD':
+            if (self.last_mode_req_time is None
+                    or (now - self.last_mode_req_time).nanoseconds * 1e-9
+                    > self.mode_req_interval):
+                self.get_logger().info('Requesting OFFBOARD mode...')
+                self._request_mode('OFFBOARD')
+                self.last_mode_req_time = now
+            return
 
-    def compute_hover_velocity(self) -> TwistStamped:
-        """Compute velocity to hover in place."""
-        vel_cmd = TwistStamped()
-        vel_cmd.header.stamp = self.get_clock().now().to_msg()
-        vel_cmd.header.frame_id = 'base_link'
+        if not self.mavros_state.armed:
+            if (self.last_arm_req_time is None
+                    or (now - self.last_arm_req_time).nanoseconds * 1e-9
+                    > self.mode_req_interval):
+                self.get_logger().info('Requesting arming...')
+                self._request_arm(True)
+                self.last_arm_req_time = now
+            return
 
-        # Only altitude control while hovering
-        if self.current_altitude is not None:
-            altitude_error = self.target_altitude - self.current_altitude
-            vel_cmd.twist.linear.z = float(np.clip(
-                self.p_gain * altitude_error,
-                -self.max_v_speed,
-                self.max_v_speed
-            ))
+        self._offboard_achieved = True
+        if not self._hover_logged:
+            self.get_logger().info(
+                'Armed in OFFBOARD -- hovering, ready for TEST/FOLLOW')
+            self._hover_logged = True
 
-        return vel_cmd
+    def _tick_follow(self):
+        """Monitor tracking status during FOLLOW."""
+        if self.tracking_status == 'LOST':
+            self.get_logger().info('Tracking lost -- entering HOVER')
+            self.flight_state = 'HOVER'
+            self.hover_start_time = self.get_clock().now()
+            # Use last known target as hover reference
+            if self.last_good_target is not None:
+                self.hover_pose = self.last_good_target
 
-    def activate(self):
-        """Activate following mode."""
-        self.mode = self.MODE_HOVER
-        self.get_logger().info('Follower activated - entering HOVER mode')
+    def _tick_hover(self):
+        """Wait for tracking recovery or timeout to auto-land."""
+        if self.tracking_status == 'TRACKING':
+            self.get_logger().info('Tracking recovered -- resuming FOLLOW')
+            self.flight_state = 'FOLLOW'
+            self.hover_start_time = None
+            return
 
-    def deactivate(self):
-        """Deactivate and return to idle."""
-        self.mode = self.MODE_IDLE
-        self.get_logger().info('Follower deactivated - entering IDLE mode')
+        if self.hover_start_time is not None:
+            elapsed = (self.get_clock().now()
+                       - self.hover_start_time).nanoseconds * 1e-9
+            if elapsed > self.hover_timeout:
+                self.get_logger().warn(
+                    f'Tracking lost for {elapsed:.1f}s -- auto-landing')
+                self._initiate_land()
+
+    def _tick_land(self):
+        """Monitor altitude during landing."""
+        pose = self._get_active_pose()
+        if pose is not None:
+            if (pose.pose.position.z <= 0.02
+                    and not getattr(self, '_landed_logged', False)):
+                self.get_logger().info(
+                    'On the ground -- disarm manually or call abort')
+                self._landed_logged = True
+
+    def _reset_to_idle(self):
+        self.flight_state       = 'IDLE'
+        self.hover_pose         = None
+        self.land_start_time    = None
+        self.land_start_alt     = None
+        self._hover_logged      = False
+        self._offboard_achieved = False
+        self._landed_logged     = False
+        self.follow_target      = None
+        self.last_good_target   = None
+        self.hover_start_time   = None
+
+    # == Course service handlers =============================================
+
+    def _handle_launch(self, request, response):
+        if self.flight_state not in ('IDLE', 'ABORT'):
+            response.success = False
+            response.message = f'Cannot launch: state={self.flight_state}'
+            return response
+
+        pose = self._get_active_pose()
+        if pose is not None:
+            self.hover_pose = PoseStamped()
+            self.hover_pose.pose.position.x  = pose.pose.position.x
+            self.hover_pose.pose.position.y  = pose.pose.position.y
+            self.hover_pose.pose.position.z  = self.takeoff_altitude
+            self.hover_pose.pose.orientation = pose.pose.orientation
+            self.get_logger().info(
+                f'Hover target: ({pose.pose.position.x:.2f}, '
+                f'{pose.pose.position.y:.2f}, {self.takeoff_altitude:.2f})')
+        else:
+            self.get_logger().warn(
+                'No pose at launch -- using default setpoint')
+
+        self.flight_state       = 'LAUNCH'
+        self.launch_time        = self.get_clock().now()
+        self.last_mode_req_time = None
+        self.last_arm_req_time  = None
+        self._hover_logged      = False
+        self._offboard_achieved = False
+
+        self.get_logger().info(
+            f'LAUNCH -- ascending to {self.takeoff_altitude}m')
+        response.success = True
+        response.message = f'Launching to {self.takeoff_altitude}m'
+        return response
+
+    def _handle_test(self, request, response):
+        """Transition to FOLLOW mode.
+
+        Uses the 'test' service name for course interface compatibility.
+        """
+        if self.flight_state not in ('LAUNCH', 'FOLLOW', 'HOVER'):
+            response.success = False
+            response.message = f'Cannot follow: state={self.flight_state}'
+            return response
+
+        self.flight_state = 'FOLLOW'
+        self.get_logger().info('FOLLOW -- tracking target')
+        response.success = True
+        response.message = 'Following active'
+        return response
+
+    def _handle_land(self, request, response):
+        if self.flight_state in ('IDLE', 'ABORT'):
+            response.success = False
+            response.message = f'Cannot land: state={self.flight_state}'
+            return response
+
+        self._initiate_land()
+        response.success = True
+        response.message = 'Landing initiated'
+        return response
+
+    def _initiate_land(self):
+        """Begin landing sequence (used by both land command and auto-land)."""
+        pose = self._get_active_pose()
+        self.land_start_alt  = (pose.pose.position.z if pose
+                                else self.takeoff_altitude)
+        self.land_start_time = self.get_clock().now()
+        self.flight_state    = 'LAND'
+        self.follow_target   = None
+
+        if pose is not None:
+            if self.hover_pose is None:
+                self.hover_pose = PoseStamped()
+                self.hover_pose.pose.orientation = pose.pose.orientation
+            self.hover_pose.pose.position.x = pose.pose.position.x
+            self.hover_pose.pose.position.y = pose.pose.position.y
+
+        self.get_logger().info(
+            f'LAND -- descending from {self.land_start_alt:.2f}m '
+            f'at {self.descent_speed} m/s')
+
+    def _handle_abort(self, request, response):
+        self.get_logger().warn('ABORT -- emergency disarm')
+        self.flight_state       = 'ABORT'
+        self.hover_pose         = None
+        self.land_start_time    = None
+        self.follow_target      = None
+        self._offboard_achieved = False
+        self._request_arm(False)
+
+        response.success = True
+        response.message = 'Emergency stop executed'
+        return response
+
+    # == MAVROS helpers ======================================================
+
+    def _request_mode(self, mode):
+        if not self.set_mode_client.service_is_ready():
+            self.get_logger().warn('set_mode service not ready')
+            return
+        req             = SetMode.Request()
+        req.custom_mode = mode
+        self.set_mode_client.call_async(req)
+
+    def _request_arm(self, arm):
+        if not self.arming_client.service_is_ready():
+            self.get_logger().warn('arming service not ready')
+            return
+        req       = CommandBool.Request()
+        req.value = arm
+        self.arming_client.call_async(req)
 
 
 def main(args=None):

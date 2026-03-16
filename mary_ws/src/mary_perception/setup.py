@@ -19,9 +19,9 @@ setup(
     entry_points={
         'console_scripts': [
             't265_pose_node = mary_perception.t265_pose_node:main',
-            'person_tracker_node = mary_perception.person_tracker_node:main',
             'pose_logger_node = mary_perception.pose_logger_node:main',
             'stereo_depth_node = mary_perception.stereo_depth_node:main',
+            'stereo_tracker_node = mary_perception.stereo_tracker_node:main',
         ],
     },
 )
