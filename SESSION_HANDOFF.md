@@ -1,22 +1,21 @@
 # MARY — Session Handoff Document
 
 **Team:** Skynet (ROB498 Capstone, Winter 2026)
-**Date:** March 9, 2026
+**Date:** March 16, 2026
 **Current Branch:** `T265_disp`
 
 ---
 
 ## Project Overview
 
-MARY (Mobile Autonomous Rain sYstem) is an autonomous umbrella drone that follows a user overhead. The ROS2 workspace (`mary_ws/src/`) contains five packages:
+MARY (Mobile Autonomous Rain sYstem) is an autonomous umbrella drone that follows a user overhead. The ROS2 workspace (`mary_ws/src/`) contains four packages:
 
 | Package | Purpose |
 |---------|---------|
-| `mary_bringup` | Launch files and parameter configs |
-| `mary_control` | Flight control nodes (stationkeeping, comm, mission manager, follower, altitude controller) |
-| `mary_perception` | T265 pose processing, person tracker (incomplete) |
-| `mary_hardware` | MAVROS launch, sensor drivers, PX4 config |
-| `mary_msgs` | Custom messages (MissionStatus, TrackingStatus, PersonDetection) |
+| `mary_bringup` | Launch files |
+| `mary_control` | Flight control nodes (stationkeeping, waypoint, follower, altitude controller) |
+| `mary_perception` | T265 pose processing, stereo depth, person tracker (incomplete) |
+| `mary_hardware` | MAVROS launch, PX4 config |
 
 ---
 
@@ -107,7 +106,7 @@ self._R_t265_to_enu = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]])
 
 ---
 
-## Flight Test 3 — IMPLEMENTED
+## Flight Test 3 — COMPLETED (confirmed working 2026-03-16)
 
 **Exercise:** Waypoint navigation — fly through 4 waypoints (40cm radius spheres) in order within 60s (90s max). Two parts: Vicon-aided (4%) and T265-only (4%).
 
@@ -165,16 +164,16 @@ ros2 launch mary_bringup flight_test_3.launch.py part:=2 t265_z_offset:=0.1234
 
 ## MARY System (Person Following) — Status
 
-The full MARY pipeline exists but is **untested and outdated**:
+Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package, `comm_node.py`, `mission_manager_node.py`, `sensors.launch.py`, `mary_full.launch.py`, `mary_params.yaml`.
 
-- **`mission_manager_node.py`** — State machine for full mission (IDLE → PREFLIGHT → ARMING → TAKEOFF → ACQUIRING → FOLLOWING → LANDING). Uses 2.5m altitude, monitors person detection.
-- **`follower_node.py`** — P-control centering person in camera frame + feedforward velocity. Publishes velocity commands at 20Hz. Max 2.0 m/s horizontal, 1.0 m/s vertical.
-- **`altitude_controller_node.py`** — PID altitude hold (Kp=1.5, Ki=0.1, Kd=0.5). Min 1.0m, max 5.0m.
-- **`person_tracker_node.py`** — **INCOMPLETE.** Has subscriber/publisher structure but all processing functions are TODO stubs. Intended to use YOLOv8n.
-- **`comm_node.py`** — Ground control interface with mission manager integration. Has waypoint subscription for FT3.
-- **`mary_full.launch.py`** — Full system launch (all nodes).
+Remaining nodes to build on:
 
-**Note:** These MARY nodes are designed for the final capstone demo, not for flight tests. They need significant work (especially person tracker) before they're usable.
+- **`follower_node.py`** — P-control person-following stub (untested). Will evolve from `waypoint_node.py` patterns.
+- **`altitude_controller_node.py`** — PID altitude hold stub (untested).
+- **`person_tracker_node.py`** — **INCOMPLETE.** Has subscriber/publisher structure but all processing functions are TODO stubs.
+- **`stereo_depth_node.py`** — **NEW (2026-03-16).** ROS2 integration of the VPI stereo disparity pipeline from `scripts/realsense_test.py`. Subscribes to T265 fisheye image topics (no pyrealsense2 needed), gets calibration from `camera_info` + tf2 extrinsics, runs VPI/CUDA stereo on GPU. Publishes `/mary/depth/disparity` (mono16 Q10.5), `/mary/depth/depth` (32FC1 metres), `/mary/depth/debug` (colorised). Next step: build blob-detection tracking on top of disparity output.
+
+**Plan:** Two new functional nodes needed — (1) stereo tracker node (disparity blob detection → target PointStamped), (2) follower node (target → MAVROS setpoints with Kalman velocity estimation). Mode switching (acquisition/tracking/recovery) lives inside follower.
 
 ---
 
@@ -200,34 +199,26 @@ The full MARY pipeline exists but is **untested and outdated**:
 ROB498-SkyNet/
 ├── mary_ws/src/
 │   ├── mary_bringup/
-│   │   ├── launch/
-│   │   │   ├── flight_test_2.launch.py    # FT2 launcher (working)
-│   │   │   ├── flight_test_3.launch.py    # FT3 launcher (new)
-│   │   │   └── mary_full.launch.py        # Full MARY launcher (untested)
-│   │   └── config/
-│   │       └── mary_params.yaml           # Central parameters
+│   │   └── launch/
+│   │       ├── flight_test_2.launch.py    # FT2 launcher (working)
+│   │       └── flight_test_3.launch.py    # FT3 launcher (working)
 │   ├── mary_control/mary_control/
 │   │   ├── stationkeeping_node.py         # FT2 controller (working)
-│   │   ├── waypoint_node.py              # FT3 controller (new)
-│   │   ├── comm_node.py                   # Ground control (has FT3 waypoint sub)
-│   │   ├── mission_manager_node.py        # MARY mission FSM (untested)
-│   │   ├── follower_node.py               # Person following (untested)
-│   │   └── altitude_controller_node.py    # PID altitude (untested)
+│   │   ├── waypoint_node.py              # FT3 controller (working)
+│   │   ├── follower_node.py               # Person following (untested stub)
+│   │   └── altitude_controller_node.py    # PID altitude (untested stub)
 │   ├── mary_perception/mary_perception/
 │   │   ├── t265_pose_node.py              # T265 VIO (working)
+│   │   ├── stereo_depth_node.py           # VPI stereo depth from T265 fisheye (new)
+│   │   ├── pose_logger_node.py            # Pose logging (working, optional)
 │   │   └── person_tracker_node.py         # Person detection (INCOMPLETE)
-│   ├── mary_hardware/
-│   │   ├── launch/
-│   │   │   ├── mavros.launch.py           # MAVROS FCU bridge
-│   │   │   └── sensors.launch.py          # T265 + IMX219 drivers
-│   │   └── config/
-│   │       ├── px4_config.yaml            # MAVROS parameters
-│   │       └── px4_pluginlists.yaml       # MAVROS plugin config
-│   └── mary_msgs/msg/
-│       ├── MissionStatus.msg
-│       ├── TrackingStatus.msg
-│       └── PersonDetection.msg
-├── scripts/                               # Utility scripts
+│   └── mary_hardware/
+│       ├── launch/
+│       │   └── mavros.launch.py           # MAVROS FCU bridge
+│       └── config/
+│           ├── px4_config.yaml            # MAVROS parameters
+│           └── px4_pluginlists.yaml       # MAVROS plugin config
+├── scripts/                               # Utility scripts (realsense_test.py, VPI stereo)
 ├── docs/                                  # Documentation
 └── venv/                                  # Python virtual environment
 ```
