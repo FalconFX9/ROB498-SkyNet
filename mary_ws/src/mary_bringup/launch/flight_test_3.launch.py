@@ -55,7 +55,7 @@ def _resolve_params(context):
                 'vicon_timeout':        0.5,
                 'vicon_yaw_offset':     float(LaunchConfiguration('vicon_yaw_offset').perform(context)),
                 't265_z_offset':        float(LaunchConfiguration('t265_z_offset').perform(context)),
-                'reach_radius':         0.4,
+                'reach_radius':         0.25,
                 'log_euler':            LaunchConfiguration('log_euler'),
             }],
         ),
@@ -153,6 +153,9 @@ def generate_launch_description():
                 'fisheye_fps':       30,
                 'pose_fps':          200,
                 'publish_odom_tf':   False,
+                'enable_relocalization': False,
+                #'topic_odom_in': '/mavros/local_position/odom',
+                #'calib_odom_file': '/home/skynet/Documents/SkyNet/offsets.json',
             }],
             output='screen',
             remappings=[

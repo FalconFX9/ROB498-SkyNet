@@ -60,7 +60,7 @@ class WaypointNode(Node):
         self.declare_parameter('vicon_timeout',         0.5)     # s
         self.declare_parameter('vicon_yaw_offset',      0.0)     # rad — additional yaw trim on top of body correction
         self.declare_parameter('t265_z_offset',         0.0)     # m (calibration)
-        self.declare_parameter('reach_radius',          0.4)     # 40 cm sphere
+        self.declare_parameter('reach_radius',          0.25)     # 40 cm sphere
         self.declare_parameter('log_euler',             False)   # Log RPY at ~2 Hz
 
         drone_id               = self.get_parameter('drone_id').value
@@ -278,7 +278,7 @@ class WaypointNode(Node):
             waypoint_poses = poses
 
         self.waypoints = np.array([
-            [p.position.y, p.position.x, p.position.z] for p in waypoint_poses
+            [-p.position.y, p.position.x, p.position.z] for p in waypoint_poses
         ])
         self.get_logger().info(
             f'Received {len(self.waypoints)} waypoints:\n{self.waypoints}'
