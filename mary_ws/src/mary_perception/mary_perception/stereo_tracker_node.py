@@ -93,6 +93,9 @@ class StereoTrackerNode(Node):
         self.declare_parameter('min_blob_area', 500)    # px at half-res
         self.declare_parameter('max_blob_count', 5)
 
+        # Foreground detection
+        self.declare_parameter('height_threshold', 0.15) # m above ground to count as foreground
+
         # Tracking filter
         self.declare_parameter('ema_alpha', 0.3)
         self.declare_parameter('lost_threshold', 15)    # frames -> LOST
@@ -360,25 +363,47 @@ class StereoTrackerNode(Node):
     # Blob detection
     # ------------------------------------------------------------------
     def _detect_blob(self, depth):
-        """Find the largest depth blob in the valid range.
+        """Find the closest (highest) object that stands above the ground.
+
+        Strategy: the ground plane is the dominant surface at some depth.
+        The RC car / person is closer to the camera (smaller depth) than
+        the ground.  We find the minimum valid depth region and track its
+        centroid.
+
+        1. Compute ground depth as the mode/median of all valid pixels
+        2. Threshold for pixels significantly closer than ground
+        3. Find the largest contour in that foreground mask
 
         Returns (cx, cy, mean_depth) or None.
         """
-        # Binary mask: pixels within depth band
-        mask = ((depth > self.depth_min)
-                & (depth < self.depth_max)).astype(np.uint8) * 255
+        # All pixels in the valid depth band
+        valid_mask = (depth > self.depth_min) & (depth < self.depth_max)
+        if not np.any(valid_mask):
+            return None
+
+        # Estimate ground depth as median of all valid pixels
+        ground_depth = float(np.median(depth[valid_mask]))
+
+        # Foreground = pixels at least height_threshold closer than ground
+        height_thresh = self.get_parameter('height_threshold').value
+        fg_max = ground_depth - height_thresh
+        if fg_max <= self.depth_min:
+            return None
+
+        fg_mask = ((depth > self.depth_min)
+                   & (depth < fg_max)).astype(np.uint8) * 255
 
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
 
-        # Sort by area descending, check top candidates
+        # Sort by area descending, pick largest foreground blob
         contours = sorted(
             contours, key=cv2.contourArea, reverse=True)[:self.max_blob_count]
 
@@ -393,17 +418,14 @@ class StereoTrackerNode(Node):
             cx = M['m10'] / M['m00']
             cy = M['m01'] / M['m00']
 
-            # Mean depth within blob
+            # Median depth within blob
             blob_mask = np.zeros(depth.shape, dtype=np.uint8)
             cv2.drawContours(blob_mask, [contour], -1, 255, -1)
-            blob_depths = depth[blob_mask > 0]
-            valid = blob_depths[
-                (blob_depths > self.depth_min)
-                & (blob_depths < self.depth_max)]
-            if len(valid) == 0:
+            blob_depths = depth[(blob_mask > 0) & (depth > self.depth_min)]
+            if len(blob_depths) == 0:
                 continue
 
-            return (cx, cy, float(np.median(valid)))
+            return (cx, cy, float(np.median(blob_depths)))
 
         return None
 
@@ -424,13 +446,13 @@ class StereoTrackerNode(Node):
         # Draw detection marker
         if detection is not None:
             cx, cy, d = detection
-            cv2.circle(d_color, (int(cx), int(cy)), 10, (0, 255, 0), 2)
+            cv2.circle(d_color, (int(cx), int(cy)), 10, (0, 0, 0), 2)
             cv2.putText(
                 d_color, f'{d:.2f}m', (int(cx) + 15, int(cy)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
         # Status overlay
-        color = (0, 255, 0) if self.tracking_status == 'TRACKING' \
+        color = (0, 0, 0) if self.tracking_status == 'TRACKING' \
             else (0, 0, 255)
         cv2.putText(
             d_color, self.tracking_status, (10, 25),

@@ -166,15 +166,23 @@ ros2 launch mary_bringup flight_test_3.launch.py part:=2 t265_z_offset:=0.1234
 
 Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package, `comm_node.py`, `mission_manager_node.py`, `sensors.launch.py`, `mary_full.launch.py`, `mary_params.yaml`, `person_tracker_node.py`, `altitude_controller_node.py`.
 
-### Implemented Nodes (2026-03-16, untested)
+### Implemented Nodes (2026-03-16)
 
-- **`stereo_tracker_node.py`** (mary_perception) — Combines VPI GPU stereo disparity with blob detection. Subscribes to T265 fisheye stereo pair, computes depth via `libstereo.so` (VPI/CUDA), thresholds depth to a configurable band (0.5–2.5m), finds largest blob via contour detection, converts centroid + depth to 3D body-frame offset, applies EMA filter. Publishes `/mary/tracking/target` (PointStamped, body frame), `/mary/tracking/status` (TRACKING/LOST), `/mary/tracking/debug` (colorized depth + overlay). Axis signs are configurable parameters for mounting calibration.
+- **`stereo_depth_node.py`** (mary_perception) — **CONFIRMED WORKING (2026-03-16).** Standalone VPI stereo depth publisher. Subscribes to T265 fisheye stereo pair via ROS topics, computes disparity via `libstereo.so` (VPI/CUDA on Jetson GPU). Publishes `/mary/depth/disparity` (mono16 Q10.5), `/mary/depth/depth` (32FC1 metres), `/mary/depth/debug` (colorized TURBO). Used for debugging/testing, not in the demo pipeline.
 
-- **`follower_node.py`** (mary_control) — Rewritten from scratch based on `waypoint_node.py` patterns. State machine: IDLE → LAUNCH → FOLLOW ↔ HOVER → LAND | ABORT. Subscribes to `/mary/tracking/target` and `/mary/tracking/status`. Converts body-frame tracking offset to world-frame setpoint using drone yaw. Rate-limits horizontal movement (1.5 m/s). On tracking loss, enters HOVER holding last known target; auto-lands after configurable timeout (default 3s). Same MAVROS integration as waypoint_node: vision pose relay, 20Hz setpoints, RC override detection, course service interface.
+- **`stereo_tracker_node.py`** (mary_perception) — Combines VPI GPU stereo disparity with blob detection (untested). Same stereo pipeline as stereo_depth_node, plus depth-band thresholding (0.5–2.5m), contour-based blob detection, centroid+depth → 3D body-frame offset, EMA filter. Publishes `/mary/tracking/target` (PointStamped, body frame), `/mary/tracking/status` (TRACKING/LOST), `/mary/tracking/debug` (colorized depth + overlay). Axis signs are configurable parameters for mounting calibration.
 
-- **`stereo_depth_node.py`** (mary_perception) — Standalone depth publisher (kept for debugging/testing). Not used by the demo pipeline.
+- **`follower_node.py`** (mary_control) — Rewritten from scratch based on `waypoint_node.py` patterns (untested). State machine: IDLE → LAUNCH → FOLLOW ↔ HOVER → LAND | ABORT. Subscribes to `/mary/tracking/target` and `/mary/tracking/status`. Converts body-frame tracking offset to world-frame setpoint using drone yaw. Rate-limits horizontal movement (1.5 m/s). On tracking loss, enters HOVER holding last known target; auto-lands after configurable timeout (default 3s). Same MAVROS integration as waypoint_node: vision pose relay, 20Hz setpoints, RC override detection, course service interface.
 
 - **`mary_demo.launch.py`** (mary_bringup) — Launch file for full person-following demo. Launches MAVROS + T265 + t265_pose_node + stereo_tracker_node + follower_node. Supports part:=1 (Vicon) and part:=2 (T265 only).
+
+### Problems Encountered & Solutions (Stereo Depth)
+
+**tf2 static transforms broken in Foxy:** The `TransformListener` buffer never receives static transforms from the realsense driver. `tf2_echo` works from CLI but the node's buffer always returns identity. Solution: hardcode T265 extrinsics from pyrealsense2 EEPROM (via `scripts/print_calibration.py`).
+
+**tf2 extrinsics in wrong frame:** Even when tf2 worked, it reported extrinsics in optical frame convention (T=[0.064, -0.001, -0.001]) which differs from pyrealsense2 sensor frame (T=[-0.0643, 0.00007, -0.00015]). Using tf2 values produced a smooth gradient instead of real disparity. Solution: use pyrealsense2 values directly.
+
+**T265 Z published negative:** The `t265_pose_node` could publish negative Z values. Added `max(0.0, z)` clamp before publishing.
 
 ### Key Topics (Person Following Pipeline)
 
@@ -190,9 +198,9 @@ T265 pose -> t265_pose_node -> /mary/localization/pose --+         |
 
 ### Next Steps
 
-1. Test stereo_tracker_node standalone with T265 plugged in (verify blob detection)
-2. Test follower_node in simulation or tethered flight
-3. Calibrate axis_sign_x / axis_sign_y parameters for T265 mounting
+1. Test stereo_tracker_node standalone (verify blob detection finds a person/object)
+2. Calibrate axis_sign_x / axis_sign_y parameters for T265 mounting
+3. Test follower_node in simulation or tethered flight
 4. Tune depth_min/depth_max, ema_alpha, hover_timeout for demo conditions
 
 ---
