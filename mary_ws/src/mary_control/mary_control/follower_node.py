@@ -116,14 +116,6 @@ class FollowerNode(Node):
         self._offboard_achieved = False
         self._raw_t265_z        = None
 
-        # -- Pose source handoff -------------------------------------------------
-        # Starts on VICON (part=1) or T265 (part=2). Can switch mid-flight.
-        #   'vicon'  -> VICON primary, T265 fallback
-        #   't265'   -> T265 primary, VICON emergency fallback only
-        self._pose_source = 'vicon' if self.use_vicon else 't265'
-        self._handoff_done = not self.use_vicon   # no handoff needed in T265-only
-        self._stable_hover_start = None           # for auto-handoff timing
-
         # -- T265 frame alignment ------------------------------------------------
         # T265 is odometry (starts at origin). When it comes online mid-flight,
         # we compute a Z offset = VICON_z - T265_z so the T265 altitude aligns
@@ -162,6 +154,14 @@ class FollowerNode(Node):
                 f'{np.degrees(self.vicon_yaw_offset):.1f} deg')
         else:
             self.get_logger().info('Vicon body-frame correction active')
+
+        # -- Pose source handoff -------------------------------------------------
+        # Starts on VICON (part=1) or T265 (part=2). Can switch mid-flight.
+        #   'vicon'  -> VICON primary, T265 fallback
+        #   't265'   -> T265 primary, VICON emergency fallback only
+        self._pose_source = 'vicon' if self.use_vicon else 't265'
+        self._handoff_done = not self.use_vicon   # no handoff needed in T265-only
+        self._stable_hover_start = None           # for auto-handoff timing
 
         # -- Subscribers ------------------------------------------------------
         self.create_subscription(
