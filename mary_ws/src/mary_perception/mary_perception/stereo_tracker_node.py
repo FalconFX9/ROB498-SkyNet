@@ -26,6 +26,7 @@ Publications:
 
 import ctypes
 import os
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -109,6 +110,12 @@ class StereoTrackerNode(Node):
         self.declare_parameter('axis_sign_x', 1.0)
         self.declare_parameter('axis_sign_y', 1.0)
 
+        # Video recording
+        self.declare_parameter('record_video', False)
+        self.declare_parameter('video_dir',
+                               os.path.expanduser(
+                                   '~/Documents/SkyNet/ROB498-SkyNet/logs'))
+
         self.lib_path       = self.get_parameter('libstereo_path').value
         self.max_disp       = self.get_parameter('max_disparity').value
         self.zoom_factor    = self.get_parameter('zoom_factor').value
@@ -125,6 +132,9 @@ class StereoTrackerNode(Node):
 
         self.axis_sign_x    = self.get_parameter('axis_sign_x').value
         self.axis_sign_y    = self.get_parameter('axis_sign_y').value
+
+        self.record_video   = self.get_parameter('record_video').value
+        self.video_dir      = self.get_parameter('video_dir').value
 
         # -- State ------------------------------------------------------------
         self.bridge    = CvBridge()
@@ -148,6 +158,16 @@ class StereoTrackerNode(Node):
         self.tracked_point = None      # filtered [x, y, z] body frame
         self.frames_without_detection = 0
         self.tracking_status = 'LOST'
+
+        # Video recording (lazy init on first frame)
+        self._vid_tracking = None      # cv2.VideoWriter
+        self._vid_depth = None         # cv2.VideoWriter
+        self._vid_frame_count = 0
+        if self.record_video:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self._vid_dir = os.path.join(self.video_dir, f'video_{ts}')
+            os.makedirs(self._vid_dir, exist_ok=True)
+            self.get_logger().info(f'Video recording enabled -> {self._vid_dir}')
 
         # -- QoS --------------------------------------------------------------
         sensor_qos = QoSProfile(
@@ -433,6 +453,8 @@ class StereoTrackerNode(Node):
     # Debug visualisation
     # ------------------------------------------------------------------
     def _publish_debug(self, depth, detection, header):
+        h, w = depth.shape[:2]
+
         d_vis = np.zeros(depth.shape, dtype=np.uint8)
         valid = depth > 0
         if np.any(valid):
@@ -442,17 +464,45 @@ class StereoTrackerNode(Node):
                 np.uint8)
 
         d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO)
+        WHITE = (255, 255, 255)
 
-        # Draw detection marker
+        # Image center crosshair (drone nadir)
+        cv2.drawMarker(d_color, (w // 2, h // 2), WHITE,
+                        cv2.MARKER_CROSS, 15, 1)
+
+        # Detection marker + control vector
         if detection is not None:
             cx, cy, d = detection
-            cv2.circle(d_color, (int(cx), int(cy)), 10, (0, 0, 0), 2)
+            icx, icy = int(cx), int(cy)
+
+            # White circle on detected blob
+            cv2.circle(d_color, (icx, icy), 10, WHITE, 2)
             cv2.putText(
-                d_color, f'{d:.2f}m', (int(cx) + 15, int(cy)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                d_color, f'{d:.2f}m', (icx + 15, icy),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
+
+            # Arrow from image center to detection = direction drone would move
+            cv2.arrowedLine(d_color, (w // 2, h // 2), (icx, icy),
+                            WHITE, 2, tipLength=0.15)
+
+            # Pixel offset text
+            dx_px = icx - w // 2
+            dy_px = icy - h // 2
+            cv2.putText(
+                d_color, f'px({dx_px:+d},{dy_px:+d})', (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
+
+        # Body-frame offset from tracked point (what follower receives)
+        if self.tracked_point is not None:
+            xb, yb, zb = self.tracked_point
+            cv2.putText(
+                d_color,
+                f'body: fwd={xb:+.2f} rgt={yb:+.2f} dwn={-zb:.2f}m',
+                (10, h - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
 
         # Status overlay
-        color = (0, 0, 0) if self.tracking_status == 'TRACKING' \
+        color = WHITE if self.tracking_status == 'TRACKING' \
             else (0, 0, 255)
         cv2.putText(
             d_color, self.tracking_status, (10, 25),
@@ -461,6 +511,68 @@ class StereoTrackerNode(Node):
         debug_msg = self.bridge.cv2_to_imgmsg(d_color, encoding='bgr8')
         debug_msg.header = header
         self.pub_debug.publish(debug_msg)
+
+        # Write frames as JPEGs for crash-proof recording
+        if self.record_video:
+            # Depth image: plain colormap without tracking overlay
+            d_vis_clean = np.zeros(depth.shape, dtype=np.uint8)
+            v = depth > 0
+            if np.any(v):
+                d_tmp = depth.copy()
+                d_tmp[~v] = 0
+                d_vis_clean = (d_tmp / self.depth_max * 255.0).clip(
+                    0, 255).astype(np.uint8)
+            depth_color = cv2.applyColorMap(d_vis_clean, cv2.COLORMAP_TURBO)
+
+            n = self._vid_frame_count
+            cv2.imwrite(os.path.join(self._vid_dir, f'tracking_{n:06d}.jpg'),
+                        d_color, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            cv2.imwrite(os.path.join(self._vid_dir, f'depth_{n:06d}.jpg'),
+                        depth_color, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            self._vid_frame_count += 1
+
+    # ------------------------------------------------------------------
+    # Video recording helpers
+    # ------------------------------------------------------------------
+    def _signal_handler(self, signum, frame):
+        """Handle SIGINT/SIGTERM — stitch videos before exit."""
+        self._stitch_videos()
+        raise SystemExit(0)
+
+    def _stitch_videos(self):
+        """Combine saved JPEG frames into .avi videos."""
+        if not self.record_video or self._vid_frame_count == 0:
+            return
+
+        self.get_logger().info(
+            f'Stitching {self._vid_frame_count} frames into videos...')
+
+        for prefix in ('tracking', 'depth'):
+            first = cv2.imread(
+                os.path.join(self._vid_dir, f'{prefix}_000000.jpg'))
+            if first is None:
+                continue
+            h, w = first.shape[:2]
+            out_path = os.path.join(self._vid_dir, f'{prefix}.avi')
+            writer = cv2.VideoWriter(
+                out_path, cv2.VideoWriter_fourcc(*'MJPG'), 15.0, (w, h))
+            for i in range(self._vid_frame_count):
+                img = cv2.imread(
+                    os.path.join(self._vid_dir, f'{prefix}_{i:06d}.jpg'))
+                if img is not None:
+                    writer.write(img)
+            writer.release()
+            self.get_logger().info(f'Saved {out_path}')
+
+            # Clean up individual frames
+            for i in range(self._vid_frame_count):
+                p = os.path.join(self._vid_dir, f'{prefix}_{i:06d}.jpg')
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        self.get_logger().info('Video stitching complete')
 
     # ------------------------------------------------------------------
     # Helpers
@@ -482,9 +594,10 @@ def main(args=None):
     node = StereoTrackerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        node._stitch_videos()
         node.destroy_node()
         rclpy.shutdown()
 

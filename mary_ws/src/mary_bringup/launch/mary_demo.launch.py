@@ -32,11 +32,52 @@ VICON_TOPIC = '/vicon/ROB498_Drone/ROB498_Drone'
 
 
 def _resolve_params(context):
-    """Configure follower node based on 'part' argument."""
+    """Configure nodes based on 'part' and 'launch_t265' arguments."""
     part = int(LaunchConfiguration('part').perform(context))
     vicon_topic = VICON_TOPIC if part == 1 else ''
+    launch_t265 = LaunchConfiguration('launch_t265').perform(context).lower() == 'true'
 
-    nodes = [
+    nodes = []
+
+    # -- T265 camera + pose node (optional — can be started manually later) --
+    if launch_t265:
+        nodes.append(Node(
+            package='realsense2_camera',
+            executable='realsense2_camera_node',
+            name='t265_camera',
+            namespace='camera',
+            parameters=[{
+                'serial_no':             '',
+                'device_type':           't265',
+                'enable_pose':           True,
+                'enable_fisheye1':       True,
+                'enable_fisheye2':       True,
+                'fisheye_fps':           30,
+                'pose_fps':              200,
+                'publish_odom_tf':       False,
+                'enable_relocalization': False,
+            }],
+            output='screen',
+            remappings=[
+                ('pose/sample',        '/camera/pose/sample'),
+                ('fisheye1/image_raw', '/camera/fisheye1/image_raw'),
+                ('fisheye2/image_raw', '/camera/fisheye2/image_raw'),
+            ],
+        ))
+        nodes.append(Node(
+            package='mary_perception',
+            executable='t265_pose_node',
+            name='t265_pose_node',
+            output='screen',
+            parameters=[{
+                'publish_rate':      30.0,
+                'publish_tf':        True,
+                'publish_to_mavros': False,
+                'log_euler':         LaunchConfiguration('log_euler'),
+            }],
+        ))
+
+    nodes += [
         # -- Stereo Tracker (perception) -----------------------------------
         Node(
             package='mary_perception',
@@ -123,7 +164,7 @@ def generate_launch_description():
                               description='Takeoff/hover altitude (m)'),
         DeclareLaunchArgument('target_alt_above',  default_value='1.0',
                               description='Target altitude above person (m)'),
-        DeclareLaunchArgument('hover_timeout',     default_value='3.0',
+        DeclareLaunchArgument('hover_timeout',     default_value='60.0',
                               description='Seconds without tracking before auto-land'),
 
         # Tracker parameters
@@ -135,6 +176,8 @@ def generate_launch_description():
                               description='Body X axis sign (flip if tracking inverted)'),
         DeclareLaunchArgument('axis_sign_y',       default_value='1.0',
                               description='Body Y axis sign (flip if tracking inverted)'),
+        DeclareLaunchArgument('launch_t265',       default_value='true',
+                              description='Launch T265 camera + pose node (set false to start manually later)'),
         DeclareLaunchArgument('libstereo_path',
                               default_value=os.path.expanduser(
                                   '~/Documents/SkyNet/ROB498-SkyNet/scripts/libstereo.so')),
@@ -151,47 +194,6 @@ def generate_launch_description():
             }.items(),
         ),
 
-        # T265 tracking camera (pose + fisheye stereo)
-        Node(
-            package='realsense2_camera',
-            executable='realsense2_camera_node',
-            name='t265_camera',
-            namespace='camera',
-            parameters=[{
-                'serial_no':             '',
-                'device_type':           't265',
-                'enable_pose':           True,
-                'enable_fisheye1':       True,
-                'enable_fisheye2':       True,
-                'fisheye_fps':           30,
-                'pose_fps':              200,
-                'publish_odom_tf':       False,
-                'enable_relocalization': False,
-            }],
-            output='screen',
-            remappings=[
-                ('pose/sample',        '/camera/pose/sample'),
-                ('fisheye1/image_raw', '/camera/fisheye1/image_raw'),
-                ('fisheye2/image_raw', '/camera/fisheye2/image_raw'),
-            ],
-        ),
-
-        # -- Perception layer --------------------------------------------------
-
-        # T265 pose processing (MAVROS relay disabled -- follower handles it)
-        Node(
-            package='mary_perception',
-            executable='t265_pose_node',
-            name='t265_pose_node',
-            output='screen',
-            parameters=[{
-                'publish_rate':      30.0,
-                'publish_tf':        True,
-                'publish_to_mavros': False,
-                'log_euler':         LaunchConfiguration('log_euler'),
-            }],
-        ),
-
-        # -- Control + Tracker (resolved via OpaqueFunction) -------------------
+        # -- T265 + Perception + Control (resolved via OpaqueFunction) ---------
         OpaqueFunction(function=_resolve_params),
     ])

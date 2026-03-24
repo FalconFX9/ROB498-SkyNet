@@ -54,12 +54,9 @@ class T265PoseNode(Node):
         self.world_frame = self.get_parameter('world_frame_id').value
         self.drone_frame = self.get_parameter('drone_frame_id').value
 
-        # Precompute T265 → ENU frame rotation (used every callback)
-        self._R_t265_to_enu = np.array([
-            [1,  0, 0],
-            [ 0, 1, 0],
-            [ 0,  0, 1],
-        ])
+        # T265 → ENU frame rotation: identity.
+        # The realsense driver already outputs pose in a usable frame.
+        self._R_t265_to_enu = np.eye(3)
         # Equivalent quaternion [x, y, z, w] for the same rotation
         self._q_t265_to_enu = tf_transformations.quaternion_from_matrix(
             np.vstack([

@@ -56,6 +56,7 @@ class FollowerNode(Node):
         self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
         self.declare_parameter('max_follow_speed',      1.5)      # m/s rate limit
         self.declare_parameter('log_euler',             False)
+        self.declare_parameter('debug_follow',          False)    # skip arming, go straight to FOLLOW
 
         drone_id               = self.get_parameter('drone_id').value
         self.takeoff_altitude  = self.get_parameter('takeoff_altitude').value
@@ -72,6 +73,7 @@ class FollowerNode(Node):
         self.hover_timeout     = self.get_parameter('hover_timeout').value
         self.max_follow_speed  = self.get_parameter('max_follow_speed').value
         self.log_euler         = self.get_parameter('log_euler').value
+        self.debug_follow      = self.get_parameter('debug_follow').value
 
         # Debug RPY publishers
         if self.log_euler:
@@ -98,6 +100,13 @@ class FollowerNode(Node):
         self._hover_logged      = False
         self._offboard_achieved = False
         self._raw_t265_z        = None
+
+        # -- T265 frame alignment ------------------------------------------------
+        # T265 is odometry (starts at origin). When it comes online mid-flight,
+        # we compute a Z offset = VICON_z - T265_z so the T265 altitude aligns
+        # with the VICON world frame. X/Y are left as-is (T265 odometry origin).
+        self.t265_z_auto_offset      = None   # float, computed once
+        self.t265_z_auto_offset_done = False
 
         # -- Tracking state ---------------------------------------------------
         self.tracking_offset    = None       # latest PointStamped from tracker
@@ -191,6 +200,15 @@ class FollowerNode(Node):
             f'target_above={self.target_alt_above}m  '
             f'setpoint={setpoint_rate}Hz  vision={vision_rate}Hz')
 
+        if self.debug_follow:
+            self.flight_state = 'FOLLOW'
+            self._offboard_achieved = True
+            self.hover_pose = PoseStamped()
+            self.hover_pose.pose.position.z = self.takeoff_altitude
+            self.hover_pose.pose.orientation.w = 1.0
+            self.get_logger().warn(
+                'DEBUG MODE: skipping arming, starting in FOLLOW state')
+
     # == Subscriber callbacks ================================================
 
     def _on_mavros_state(self, msg):
@@ -198,7 +216,27 @@ class FollowerNode(Node):
 
     def _on_t265_pose(self, msg):
         self._raw_t265_z = msg.pose.position.z
+
+        # Auto-compute Z offset on first T265 pose if VICON is available.
+        # This aligns T265 altitude to the VICON world frame when T265
+        # is started mid-flight.
+        if not self.t265_z_auto_offset_done and self.vicon_pose is not None:
+            now = self.get_clock().now()
+            vicon_age = (now - self.vicon_stamp).nanoseconds * 1e-9
+            if vicon_age < self.vicon_timeout:
+                vicon_z = self.vicon_pose.pose.position.z
+                t265_z = msg.pose.position.z
+                self.t265_z_auto_offset = vicon_z - t265_z
+                self.t265_z_auto_offset_done = True
+                self.get_logger().info(
+                    f'T265 Z auto-offset computed: {self.t265_z_auto_offset:.3f}m '
+                    f'(VICON={vicon_z:.3f}, T265={t265_z:.3f})')
+
+        # Apply both the manual calibration offset and the auto offset
         msg.pose.position.z += self.t265_z_offset
+        if self.t265_z_auto_offset is not None:
+            msg.pose.position.z += self.t265_z_auto_offset
+
         self.t265_pose  = msg
         self.t265_stamp = self.get_clock().now()
 
@@ -299,15 +337,10 @@ class FollowerNode(Node):
         dy_body = self.tracking_offset.point.y  # right
         dz_body = self.tracking_offset.point.z  # down (negative)
 
-        # Rotate horizontal offset body -> world using yaw
-        yaw = self._get_current_yaw()
-        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-        dx_world = dx_body * cos_y - dy_body * sin_y
-        dy_world = dx_body * sin_y + dy_body * cos_y
-
-        # Person position in world frame
-        person_x = pos[0] + dx_world
-        person_y = pos[1] + dy_world
+        # Body frame ≈ world frame (drone flies with fixed heading, no yaw rotation)
+        # Negate: offset points drone→person, but we want drone to move toward person
+        person_x = pos[0] - dx_body
+        person_y = pos[1] - dy_body
         person_z = pos[2] + dz_body   # dz_body is negative
 
         # Setpoint: directly above person at target altitude
@@ -503,13 +536,13 @@ class FollowerNode(Node):
 
     def _tick_follow(self):
         """Monitor tracking status during FOLLOW."""
-        if self.tracking_status == 'LOST':
+        if self.tracking_status == 'LOST' and self.last_good_target is not None:
+            # Only transition to HOVER if we had tracking before and lost it.
+            # Don't transition if we never had tracking (e.g. startup).
             self.get_logger().info('Tracking lost -- entering HOVER')
             self.flight_state = 'HOVER'
             self.hover_start_time = self.get_clock().now()
-            # Use last known target as hover reference
-            if self.last_good_target is not None:
-                self.hover_pose = self.last_good_target
+            self.hover_pose = self.last_good_target
 
     def _tick_hover(self):
         """Wait for tracking recovery or timeout to auto-land."""
@@ -538,16 +571,18 @@ class FollowerNode(Node):
                 self._landed_logged = True
 
     def _reset_to_idle(self):
-        self.flight_state       = 'IDLE'
-        self.hover_pose         = None
-        self.land_start_time    = None
-        self.land_start_alt     = None
-        self._hover_logged      = False
-        self._offboard_achieved = False
-        self._landed_logged     = False
-        self.follow_target      = None
-        self.last_good_target   = None
-        self.hover_start_time   = None
+        self.flight_state            = 'IDLE'
+        self.hover_pose              = None
+        self.land_start_time         = None
+        self.land_start_alt          = None
+        self._hover_logged           = False
+        self._offboard_achieved      = False
+        self._landed_logged          = False
+        self.follow_target           = None
+        self.last_good_target        = None
+        self.hover_start_time        = None
+        self.t265_z_auto_offset      = None
+        self.t265_z_auto_offset_done = False
 
     # == Course service handlers =============================================
 
