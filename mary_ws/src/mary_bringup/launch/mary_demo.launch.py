@@ -90,6 +90,7 @@ def _resolve_params(context):
                 'zoom_factor':        1.5,
                 'median_filter_size': 3,
                 'publish_debug':      True,
+                'record_video':       LaunchConfiguration('record_video'),
                 'depth_min':          float(LaunchConfiguration('depth_min').perform(context)),
                 'depth_max':          float(LaunchConfiguration('depth_max').perform(context)),
                 'min_blob_area':      500,
@@ -178,6 +179,8 @@ def generate_launch_description():
                               description='Body Y axis sign (flip if tracking inverted)'),
         DeclareLaunchArgument('launch_t265',       default_value='true',
                               description='Launch T265 camera + pose node (set false to start manually later)'),
+        DeclareLaunchArgument('record_video',      default_value='false',
+                              description='Record tracking/depth debug to video files'),
         DeclareLaunchArgument('libstereo_path',
                               default_value=os.path.expanduser(
                                   '~/Documents/SkyNet/ROB498-SkyNet/scripts/libstereo.so')),

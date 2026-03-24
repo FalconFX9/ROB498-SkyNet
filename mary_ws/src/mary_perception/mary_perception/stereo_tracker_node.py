@@ -159,15 +159,15 @@ class StereoTrackerNode(Node):
         self.frames_without_detection = 0
         self.tracking_status = 'LOST'
 
-        # Video recording (lazy init on first frame)
-        self._vid_tracking = None      # cv2.VideoWriter
-        self._vid_depth = None         # cv2.VideoWriter
-        self._vid_frame_count = 0
+        # Video recording (lazy init on first debug frame)
+        self._vid_writer = None        # cv2.VideoWriter
+        self._vid_path = None
         if self.record_video:
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self._vid_dir = os.path.join(self.video_dir, f'video_{ts}')
-            os.makedirs(self._vid_dir, exist_ok=True)
-            self.get_logger().info(f'Video recording enabled -> {self._vid_dir}')
+            os.makedirs(self.video_dir, exist_ok=True)
+            self._vid_path = os.path.join(self.video_dir, f'tracking_{ts}.mkv')
+            self._prune_old_videos(keep=2)  # 2 old + 1 new = 3 total
+            self.get_logger().info(f'Video recording enabled -> {self._vid_path}')
 
         # -- QoS --------------------------------------------------------------
         sensor_qos = QoSProfile(
@@ -512,67 +512,38 @@ class StereoTrackerNode(Node):
         debug_msg.header = header
         self.pub_debug.publish(debug_msg)
 
-        # Write frames as JPEGs for crash-proof recording
+        # Write frame directly to video
         if self.record_video:
-            # Depth image: plain colormap without tracking overlay
-            d_vis_clean = np.zeros(depth.shape, dtype=np.uint8)
-            v = depth > 0
-            if np.any(v):
-                d_tmp = depth.copy()
-                d_tmp[~v] = 0
-                d_vis_clean = (d_tmp / self.depth_max * 255.0).clip(
-                    0, 255).astype(np.uint8)
-            depth_color = cv2.applyColorMap(d_vis_clean, cv2.COLORMAP_TURBO)
-
-            n = self._vid_frame_count
-            cv2.imwrite(os.path.join(self._vid_dir, f'tracking_{n:06d}.jpg'),
-                        d_color, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            cv2.imwrite(os.path.join(self._vid_dir, f'depth_{n:06d}.jpg'),
-                        depth_color, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            self._vid_frame_count += 1
+            if self._vid_writer is None:
+                h, w = d_color.shape[:2]
+                self._vid_writer = cv2.VideoWriter(
+                    self._vid_path, cv2.VideoWriter_fourcc(*'H264'),
+                    15.0, (w, h))
+                self.get_logger().info(f'Video writer opened: {w}x{h}')
+            self._vid_writer.write(d_color)
 
     # ------------------------------------------------------------------
     # Video recording helpers
     # ------------------------------------------------------------------
+    def _prune_old_videos(self, keep=2):
+        """Keep only the most recent `keep` tracking videos in video_dir."""
+        vids = sorted(
+            [f for f in os.listdir(self.video_dir)
+             if f.startswith('tracking_') and f.endswith('.mkv')])
+        for old in vids[:-keep]:
+            path = os.path.join(self.video_dir, old)
+            try:
+                os.remove(path)
+                self.get_logger().info(f'Pruned old video: {old}')
+            except OSError:
+                pass
+
     def _signal_handler(self, signum, frame):
-        """Handle SIGINT/SIGTERM — stitch videos before exit."""
-        self._stitch_videos()
+        """Handle SIGINT/SIGTERM — release video writer before exit."""
+        if self._vid_writer is not None:
+            self._vid_writer.release()
+            self.get_logger().info(f'Video saved: {self._vid_path}')
         raise SystemExit(0)
-
-    def _stitch_videos(self):
-        """Combine saved JPEG frames into .avi videos."""
-        if not self.record_video or self._vid_frame_count == 0:
-            return
-
-        self.get_logger().info(
-            f'Stitching {self._vid_frame_count} frames into videos...')
-
-        for prefix in ('tracking', 'depth'):
-            first = cv2.imread(
-                os.path.join(self._vid_dir, f'{prefix}_000000.jpg'))
-            if first is None:
-                continue
-            h, w = first.shape[:2]
-            out_path = os.path.join(self._vid_dir, f'{prefix}.avi')
-            writer = cv2.VideoWriter(
-                out_path, cv2.VideoWriter_fourcc(*'MJPG'), 15.0, (w, h))
-            for i in range(self._vid_frame_count):
-                img = cv2.imread(
-                    os.path.join(self._vid_dir, f'{prefix}_{i:06d}.jpg'))
-                if img is not None:
-                    writer.write(img)
-            writer.release()
-            self.get_logger().info(f'Saved {out_path}')
-
-            # Clean up individual frames
-            for i in range(self._vid_frame_count):
-                p = os.path.join(self._vid_dir, f'{prefix}_{i:06d}.jpg')
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
-        self.get_logger().info('Video stitching complete')
 
     # ------------------------------------------------------------------
     # Helpers
@@ -597,7 +568,9 @@ def main(args=None):
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        node._stitch_videos()
+        if node._vid_writer is not None:
+            node._vid_writer.release()
+            node.get_logger().info(f'Video saved: {node._vid_path}')
         node.destroy_node()
         rclpy.shutdown()
 
