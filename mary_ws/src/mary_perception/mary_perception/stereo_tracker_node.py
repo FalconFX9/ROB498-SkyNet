@@ -90,7 +90,7 @@ class StereoTrackerNode(Node):
 
         # Blob detection
         self.declare_parameter('depth_min', 0.5)        # m -- closest valid depth
-        self.declare_parameter('depth_max', 2.5)        # m -- farthest valid depth
+        self.declare_parameter('depth_max', 3.5)        # m -- farthest valid depth
         self.declare_parameter('min_blob_area', 125)    # px at half-res
         self.declare_parameter('max_blob_count', 5)
 
@@ -512,15 +512,19 @@ class StereoTrackerNode(Node):
             self._fps_timer = now
 
         # -- Depth colormap -----------------------------------------------
+        # Normalize depth to [depth_min, depth_max] so the colormap contrast
+        # is concentrated on the detection band (close objects pop vs ground).
         d_vis = np.zeros(depth.shape, dtype=np.uint8)
         valid = depth > 0
         if np.any(valid):
-            d_norm = depth.copy()
-            d_norm[~valid] = 0
-            d_vis = (d_norm / self.depth_max * 255.0).clip(0, 255).astype(
-                np.uint8)
+            d_range = max(self.depth_max - self.depth_min, 0.01)
+            d_vis = ((depth - self.depth_min) / d_range * 255.0
+                     ).clip(0, 255).astype(np.uint8)
+            d_vis[~valid] = 0
 
         d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO)
+        # Black out invalid pixels so they don't distract
+        d_color[~valid] = 0
         WHITE = (255, 255, 255)
         GREY = (180, 180, 180)
         F = cv2.FONT_HERSHEY_SIMPLEX

@@ -74,7 +74,8 @@ class FollowerNode(Node):
         drone_id               = self.get_parameter('drone_id').value
         self.takeoff_altitude  = self.get_parameter('takeoff_altitude').value
         self.target_alt_above  = self.get_parameter('target_altitude_above').value
-        setpoint_rate          = self.get_parameter('setpoint_rate').value
+        self.setpoint_rate     = self.get_parameter('setpoint_rate').value
+        setpoint_rate          = self.setpoint_rate
         vision_rate            = self.get_parameter('vision_pose_rate').value
         self.descent_speed     = self.get_parameter('descent_speed').value
         self.offboard_wait     = self.get_parameter('offboard_wait').value
@@ -454,7 +455,7 @@ class FollowerNode(Node):
                     dx = target.pose.position.x - pos[0]
                     dy = target.pose.position.y - pos[1]
                     dist = np.sqrt(dx*dx + dy*dy)
-                    dt = 1.0 / 20.0
+                    dt = 1.0 / self.setpoint_rate
                     max_step = self.max_follow_speed * dt
                     if dist > max_step:
                         scale = max_step / dist
