@@ -9,14 +9,20 @@ Launches the full person-following pipeline:
   - Follower       (tracking -> position setpoints -> MAVROS)
 
 Usage:
-  # With VICON ground truth:
+  # With VICON ground truth (takeoff on VICON, manual handoff to T265):
   ros2 launch mary_bringup mary_demo.launch.py part:=1
+
+  # With VICON + auto handoff to T265 after stable hover:
+  ros2 launch mary_bringup mary_demo.launch.py part:=1 auto_handoff:=true
 
   # T265 only (no VICON):
   ros2 launch mary_bringup mary_demo.launch.py part:=2
 
   # With calibrated T265 offset:
   ros2 launch mary_bringup mary_demo.launch.py part:=2 t265_z_offset:=0.1234
+
+  # Manual pose handoff (from another terminal):
+  ros2 service call /rob498_drone_10/comm/switch_pose std_srvs/srv/Trigger
 """
 
 from launch import LaunchDescription
@@ -121,6 +127,8 @@ def _resolve_params(context):
                 'vicon_yaw_offset':      float(LaunchConfiguration('vicon_yaw_offset').perform(context)),
                 't265_z_offset':         float(LaunchConfiguration('t265_z_offset').perform(context)),
                 'hover_timeout':         float(LaunchConfiguration('hover_timeout').perform(context)),
+                'auto_handoff':          LaunchConfiguration('auto_handoff').perform(context).lower() == 'true',
+                'handoff_stable_secs':   float(LaunchConfiguration('handoff_stable_secs').perform(context)),
                 'max_follow_speed':      1.5,
                 'log_euler':             LaunchConfiguration('log_euler'),
             }],
@@ -161,12 +169,16 @@ def generate_launch_description():
         DeclareLaunchArgument('log_dir',          default_value=''),
 
         # Follower parameters
-        DeclareLaunchArgument('takeoff_altitude',  default_value='1.5',
+        DeclareLaunchArgument('takeoff_altitude',    default_value='1.5',
                               description='Takeoff/hover altitude (m)'),
-        DeclareLaunchArgument('target_alt_above',  default_value='1.0',
+        DeclareLaunchArgument('target_alt_above',    default_value='1.0',
                               description='Target altitude above person (m)'),
-        DeclareLaunchArgument('hover_timeout',     default_value='60.0',
+        DeclareLaunchArgument('hover_timeout',       default_value='60.0',
                               description='Seconds without tracking before auto-land'),
+        DeclareLaunchArgument('auto_handoff',        default_value='false',
+                              description='Auto switch VICON->T265 after stable hover'),
+        DeclareLaunchArgument('handoff_stable_secs', default_value='3.0',
+                              description='Seconds of stable hover before auto handoff'),
 
         # Tracker parameters
         DeclareLaunchArgument('depth_min',         default_value='0.5',

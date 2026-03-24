@@ -1,7 +1,7 @@
 # MARY — Session Handoff Document
 
 **Team:** Skynet (ROB498 Capstone, Winter 2026)
-**Date:** March 16, 2026
+**Date:** March 24, 2026
 **Current Branch:** `T265_disp`
 
 ---
@@ -13,8 +13,8 @@ MARY (Mobile Autonomous Rain sYstem) is an autonomous umbrella drone that follow
 | Package | Purpose |
 |---------|---------|
 | `mary_bringup` | Launch files |
-| `mary_control` | Flight control nodes (stationkeeping, waypoint, follower, altitude controller) |
-| `mary_perception` | T265 pose processing, stereo depth, person tracker (incomplete) |
+| `mary_control` | Flight control nodes (stationkeeping, waypoint, follower) |
+| `mary_perception` | T265 pose processing, stereo depth/tracking |
 | `mary_hardware` | MAVROS launch, PX4 config |
 
 ---
@@ -166,23 +166,55 @@ ros2 launch mary_bringup flight_test_3.launch.py part:=2 t265_z_offset:=0.1234
 
 Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package, `comm_node.py`, `mission_manager_node.py`, `sensors.launch.py`, `mary_full.launch.py`, `mary_params.yaml`, `person_tracker_node.py`, `altitude_controller_node.py`.
 
-### Implemented Nodes (2026-03-16)
+### Implemented Nodes
 
 - **`stereo_depth_node.py`** (mary_perception) — **CONFIRMED WORKING (2026-03-16).** Standalone VPI stereo depth publisher. Subscribes to T265 fisheye stereo pair via ROS topics, computes disparity via `libstereo.so` (VPI/CUDA on Jetson GPU). Publishes `/mary/depth/disparity` (mono16 Q10.5), `/mary/depth/depth` (32FC1 metres), `/mary/depth/debug` (colorized TURBO). Used for debugging/testing, not in the demo pipeline.
 
-- **`stereo_tracker_node.py`** (mary_perception) — Combines VPI GPU stereo disparity with blob detection (untested). Same stereo pipeline as stereo_depth_node, plus depth-band thresholding (0.5–2.5m), contour-based blob detection, centroid+depth → 3D body-frame offset, EMA filter. Publishes `/mary/tracking/target` (PointStamped, body frame), `/mary/tracking/status` (TRACKING/LOST), `/mary/tracking/debug` (colorized depth + overlay). Axis signs are configurable parameters for mounting calibration.
+- **`stereo_tracker_node.py`** (mary_perception) — **CONFIRMED WORKING (2026-03-24).** Combines VPI GPU stereo disparity with blob detection for tracking an object (RC car / person) below the drone. Subscribes to T265 fisheye stereo pair, computes disparity via VPI/CUDA, performs foreground detection (ground plane estimation via median depth, foreground = pixels closer than ground by `height_threshold`), finds largest contour, computes 3D body-frame offset via centroid+depth, applies EMA filter. Publishes `/mary/tracking/target` (PointStamped, body frame), `/mary/tracking/status` (TRACKING/LOST), `/mary/tracking/debug` (colorized depth + overlay with tracking status, flight state, FPS, body offset, pose, setpoint). Features:
+  - **Performance optimization:** CPU downsample 848x800 → 424x400 before rectification (4x cheaper remap), VPI output at 212x200. Achieves ~7-8 FPS on Jetson Nano.
+  - **Video recording:** `record_video:=true` parameter saves debug frames to `logs/tracking_YYYYMMDD_HHMMSS.mkv` using H264 codec at actual measured FPS. Auto-prunes to keep only 3 most recent videos.
+  - **Debug overlay:** Shows tracking status, flight state, FPS, body-frame offsets (fwd/rgt/dwn), current pose, current setpoint, pixel offset, arrow from image center to detection.
+  - Axis signs configurable for T265 mounting calibration.
 
-- **`follower_node.py`** (mary_control) — Rewritten from scratch based on `waypoint_node.py` patterns (untested). State machine: IDLE → LAUNCH → FOLLOW ↔ HOVER → LAND | ABORT. Subscribes to `/mary/tracking/target` and `/mary/tracking/status`. Converts body-frame tracking offset to world-frame setpoint using drone yaw. Rate-limits horizontal movement (1.5 m/s). On tracking loss, enters HOVER holding last known target; auto-lands after configurable timeout (default 3s). Same MAVROS integration as waypoint_node: vision pose relay, 20Hz setpoints, RC override detection, course service interface.
+- **`follower_node.py`** (mary_control) — **BENCH-TESTED (2026-03-24), NOT FLIGHT-TESTED.** Rewritten from scratch based on `waypoint_node.py` patterns. State machine: IDLE → LAUNCH → FOLLOW ↔ HOVER → LAND | ABORT. Subscribes to `/mary/tracking/target` and `/mary/tracking/status`. Converts body-frame tracking offset to world-frame setpoint (no yaw rotation — drone flies with fixed heading, T265-to-ENU is identity). Negates offset so drone moves toward target. Rate-limits horizontal movement (1.5 m/s). On tracking loss, enters HOVER holding last known target; auto-lands after configurable timeout (default 60s in launch, 3s default param). Features:
+  - **Pose source handoff (VICON → T265):** In part=1, takeoff uses VICON for reliable position. Once airborne and stable, hands off to T265 as primary pose source (Z offset calibrated from VICON). Two modes:
+    - **Auto handoff** (`auto_handoff:=true`): After T265 Z offset is calibrated and drone has been in stable OFFBOARD hover for `handoff_stable_secs` (default 3s), automatically switches to T265.
+    - **Manual handoff:** Call `ros2 service call /rob498_drone_10/comm/switch_pose std_srvs/srv/Trigger` from a terminal.
+    - After handoff, VICON is kept as emergency fallback only (used if T265 pose drops out). Pose source resets to VICON on `_reset_to_idle`.
+  - **`debug_follow` parameter:** Skips LAUNCH/arming, goes directly to FOLLOW for bench testing without MAVROS.
+  - **`launch_t265` parameter** in `mary_demo.launch.py`: Set to `false` to launch without T265 driver (for VICON-only takeoff, start T265 manually later).
+  - **T265 Z auto-offset:** When VICON is active and T265 pose first arrives, automatically computes Z offset to align T265 odometry with VICON world frame.
+  - Same MAVROS integration as waypoint_node: vision pose relay, 20Hz setpoints, RC override detection, course service interface.
 
-- **`mary_demo.launch.py`** (mary_bringup) — Launch file for full person-following demo. Launches MAVROS + T265 + t265_pose_node + stereo_tracker_node + follower_node. Supports part:=1 (Vicon) and part:=2 (T265 only).
+- **`mary_demo.launch.py`** (mary_bringup) — Launch file for full person-following demo. Launches MAVROS + (optional) T265 + t265_pose_node + stereo_tracker_node + follower_node. Supports `part:=1` (Vicon) and `part:=2` (T265 only). `launch_t265:=false` to defer T265 startup. `auto_handoff:=true` for automatic VICON→T265 handoff after stable hover.
 
-### Problems Encountered & Solutions (Stereo Depth)
+### Problems Encountered & Solutions (Stereo Depth / Tracking)
 
-**tf2 static transforms broken in Foxy:** The `TransformListener` buffer never receives static transforms from the realsense driver. `tf2_echo` works from CLI but the node's buffer always returns identity. Solution: hardcode T265 extrinsics from pyrealsense2 EEPROM (via `scripts/print_calibration.py`).
+**tf2 static transforms broken in Foxy:** The `TransformListener` buffer never receives static transforms from the realsense driver. `tf2_echo` works from CLI but the node's buffer always returns identity (baseline=0.0mm). Solution: hardcode T265 extrinsics from pyrealsense2 EEPROM (via `scripts/print_calibration.py`).
 
-**tf2 extrinsics in wrong frame:** Even when tf2 worked, it reported extrinsics in optical frame convention (T=[0.064, -0.001, -0.001]) which differs from pyrealsense2 sensor frame (T=[-0.0643, 0.00007, -0.00015]). Using tf2 values produced a smooth gradient instead of real disparity. Solution: use pyrealsense2 values directly.
+**tf2 extrinsics in wrong frame:** Even when tf2 worked, it reported extrinsics in optical frame convention (T=[0.064, -0.001, -0.001]) which differs from pyrealsense2 sensor frame (T=[-0.0643, 0.00007, -0.00015]). Using tf2 values produced a smooth gradient instead of real disparity. Solution: use pyrealsense2 values directly. Hardcoded in both `stereo_depth_node.py` and `stereo_tracker_node.py`.
 
 **T265 Z published negative:** The `t265_pose_node` could publish negative Z values. Added `max(0.0, z)` clamp before publishing.
+
+**Setpoint direction flipped:** Body-frame offset from tracker pointed drone→person, but follower added it to position (moving away from target). Fix: negate dx_body and dy_body when computing person world position.
+
+**debug_follow race condition:** With `debug_follow:=true`, follower started in FOLLOW but `tracking_status` defaulted to 'LOST', causing immediate transition to HOVER. Fix: only transition FOLLOW→HOVER after at least one TRACKING status has been received (skip if `_ever_tracked` is False).
+
+**QoS mismatch for rosbag recording:** T265 fisheye topics use BEST_EFFORT QoS, but `ros2 bag record` defaults to RELIABLE. Result: only ~10 frames captured in 45s. Fix: use QoS override file:
+```bash
+echo '/camera/fisheye1/image_raw:
+  reliability: best_effort
+/camera/fisheye2/image_raw:
+  reliability: best_effort
+/camera/fisheye1/camera_info:
+  reliability: best_effort
+/camera/fisheye2/camera_info:
+  reliability: best_effort' > /tmp/qos.yaml
+
+ros2 bag record --qos-profile-overrides-path /tmp/qos.yaml /camera/fisheye1/image_raw /camera/fisheye2/image_raw /camera/fisheye1/camera_info /camera/fisheye2/camera_info /mary/tracking/target /mary/tracking/status /mary/tracking/debug
+```
+
+**Video recording codec:** `h264_nvmpi` not available in system ffmpeg, `h264_omx` missing OMX libraries. Fell back to `cv2.VideoWriter` with H264 fourcc which works on Jetson's OpenCV build.
 
 ### Key Topics (Person Following Pipeline)
 
@@ -190,18 +222,42 @@ Skeleton cleanup done 2026-03-16. Removed unused artifacts: `mary_msgs` package,
 T265 fisheye L/R -> stereo_tracker_node -> /mary/tracking/target (PointStamped)
                          |                         |
                          +-> /mary/tracking/debug   v
-                                              follower_node -> /mavros/setpoint_position/local
-T265 pose -> t265_pose_node -> /mary/localization/pose --+         |
-                                                                    v
-                                                         /mavros/vision_pose/pose
+                         +-> /mary/tracking/status  follower_node -> /mavros/setpoint_position/local
+                                                         |
+T265 pose -> t265_pose_node -> /mary/localization/pose --+
+                                                         |
+                                                         +-> /mavros/vision_pose/pose
+```
+
+### Bench Test Commands (no MAVROS/flight)
+
+```bash
+# Terminal 1: T265 camera
+ros2 launch realsense2_camera rs_launch.py device_type:=t265 enable_fisheye1:=true enable_fisheye2:=true enable_pose:=true
+
+# Terminal 2: T265 pose node
+ros2 run mary_perception t265_pose_node --ros-args -p publish_to_mavros:=false
+
+# Terminal 3: Stereo tracker (with video recording)
+ros2 run mary_perception stereo_tracker_node --ros-args -p record_video:=true
+
+# Terminal 4: Follower (debug mode, no MAVROS needed)
+ros2 run mary_control follower_node --ros-args -p vicon_topic:="''" -p debug_follow:=true
+
+# Terminal 5: View debug image
+ros2 run rqt_image_view rqt_image_view /mary/tracking/debug
+
+# Terminal 6: Watch setpoints
+ros2 topic echo /mavros/setpoint_position/local
 ```
 
 ### Next Steps
 
-1. Test stereo_tracker_node standalone (verify blob detection finds a person/object)
-2. Calibrate axis_sign_x / axis_sign_y parameters for T265 mounting
-3. Test follower_node in simulation or tethered flight
-4. Tune depth_min/depth_max, ema_alpha, hover_timeout for demo conditions
+1. **Flight test** the tracking + following pipeline (VICON takeoff → start T265 → enable following)
+2. **Tune parameters** for flight conditions: `depth_min`/`depth_max`, `height_threshold`, `ema_alpha`, `min_blob_area` (may need lowering for 212x200 output)
+3. **Calibrate axis signs** (`axis_sign_x`, `axis_sign_y`) during first flight — verify fwd/rgt directions match physical movement
+4. **Test tracking recovery** — verify FOLLOW↔HOVER transitions work in flight
+5. **Measure end-to-end latency** — target <330ms per proposal
 
 ---
 
@@ -246,7 +302,8 @@ ROB498-SkyNet/
 │       └── config/
 │           ├── px4_config.yaml            # MAVROS parameters
 │           └── px4_pluginlists.yaml       # MAVROS plugin config
-├── scripts/                               # Utility scripts (realsense_test.py, VPI stereo)
+├── scripts/                               # Utility scripts (realsense_test.py, VPI stereo, print_calibration.py)
+├── logs/                                  # Auto-saved tracking debug videos (.mkv)
 ├── docs/                                  # Documentation
 └── venv/                                  # Python virtual environment
 ```
@@ -269,3 +326,7 @@ ROB498-SkyNet/
 - **Position setpoints** preferred over velocity for stability in flight tests
 - **T265 `publish_to_mavros=False`** in flight test launches to avoid relay conflicts
 - **Manual disarm** after landing — no auto-disarm to avoid accidental disarm in flight
+- **T265→ENU transform is identity** (180° Z rotation in t265_pose_node). Drone flies with fixed heading, so body→world yaw rotation is skipped in follower.
+- **Hardcoded T265 extrinsics** — tf2 is broken in Foxy for this use case. Factory values from pyrealsense2 EEPROM hardcoded in stereo nodes.
+- **Half-res remap optimization** — raw 848x800 downsampled to 424x400 before CPU rectification, VPI outputs at 212x200. Saves 4x remap cost.
+- **`--symlink-install`** used for colcon build — Python changes take effect on node restart without rebuild.

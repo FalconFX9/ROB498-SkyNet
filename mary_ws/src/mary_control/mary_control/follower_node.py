@@ -8,15 +8,26 @@ waypoint_node.py patterns (FT2/FT3) with tracking-specific logic.
 Flight state machine:
     IDLE  ->  LAUNCH  ->  FOLLOW  <->  HOVER  ->  LAND  |  ABORT
 
+Pose source handoff:
+    In part=1 (VICON mode), the drone takes off using VICON for reliable
+    position estimation.  Once airborne and stable, it can hand off to T265
+    as the primary pose source (with a Z offset calibrated from VICON).
+    This can happen automatically after Z offset calibration + stable hover
+    (auto_handoff=true) or via a manual service call.
+
+    After handoff, VICON is kept as an emergency fallback only — if T265
+    drops out, VICON will be used temporarily until T265 recovers.
+
 The stereo_tracker_node publishes the target's 3D offset in body frame.
 This node converts that to world-frame position setpoints for MAVROS.
 
 Course interface (service servers):
-    {drone_id}/comm/launch  (Trigger) -- Arm, OFFBOARD, ascend
-    {drone_id}/comm/test    (Trigger) -- Begin following (kept as "test"
-                                         for course interface compat)
-    {drone_id}/comm/land    (Trigger) -- Smooth descent
-    {drone_id}/comm/abort   (Trigger) -- Emergency disarm
+    {drone_id}/comm/launch       (Trigger) -- Arm, OFFBOARD, ascend
+    {drone_id}/comm/test         (Trigger) -- Begin following (kept as "test"
+                                              for course interface compat)
+    {drone_id}/comm/land         (Trigger) -- Smooth descent
+    {drone_id}/comm/abort        (Trigger) -- Emergency disarm
+    {drone_id}/comm/switch_pose  (Trigger) -- Hand off pose source to T265
 """
 
 import numpy as np
@@ -55,6 +66,8 @@ class FollowerNode(Node):
         self.declare_parameter('t265_z_offset',         0.0)      # m
         self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
         self.declare_parameter('max_follow_speed',      1.5)      # m/s rate limit
+        self.declare_parameter('auto_handoff',          False)    # auto switch to T265 after Z cal
+        self.declare_parameter('handoff_stable_secs',   3.0)     # s of stable hover before auto handoff
         self.declare_parameter('log_euler',             False)
         self.declare_parameter('debug_follow',          False)    # skip arming, go straight to FOLLOW
 
@@ -72,6 +85,8 @@ class FollowerNode(Node):
         self.t265_z_offset     = self.get_parameter('t265_z_offset').value
         self.hover_timeout     = self.get_parameter('hover_timeout').value
         self.max_follow_speed  = self.get_parameter('max_follow_speed').value
+        self.auto_handoff      = self.get_parameter('auto_handoff').value
+        self.handoff_stable_s  = self.get_parameter('handoff_stable_secs').value
         self.log_euler         = self.get_parameter('log_euler').value
         self.debug_follow      = self.get_parameter('debug_follow').value
 
@@ -100,6 +115,14 @@ class FollowerNode(Node):
         self._hover_logged      = False
         self._offboard_achieved = False
         self._raw_t265_z        = None
+
+        # -- Pose source handoff -------------------------------------------------
+        # Starts on VICON (part=1) or T265 (part=2). Can switch mid-flight.
+        #   'vicon'  -> VICON primary, T265 fallback
+        #   't265'   -> T265 primary, VICON emergency fallback only
+        self._pose_source = 'vicon' if self.use_vicon else 't265'
+        self._handoff_done = not self.use_vicon   # no handoff needed in T265-only
+        self._stable_hover_start = None           # for auto-handoff timing
 
         # -- T265 frame alignment ------------------------------------------------
         # T265 is odometry (starts at origin). When it comes online mid-flight,
@@ -181,13 +204,15 @@ class FollowerNode(Node):
 
         # -- Course service servers -------------------------------------------
         self.create_service(
-            Trigger, f'{drone_id}/comm/launch', self._handle_launch)
+            Trigger, f'{drone_id}/comm/launch',      self._handle_launch)
         self.create_service(
-            Trigger, f'{drone_id}/comm/test',   self._handle_test)
+            Trigger, f'{drone_id}/comm/test',         self._handle_test)
         self.create_service(
-            Trigger, f'{drone_id}/comm/land',   self._handle_land)
+            Trigger, f'{drone_id}/comm/land',         self._handle_land)
         self.create_service(
-            Trigger, f'{drone_id}/comm/abort',  self._handle_abort)
+            Trigger, f'{drone_id}/comm/abort',        self._handle_abort)
+        self.create_service(
+            Trigger, f'{drone_id}/comm/switch_pose',  self._handle_switch_pose)
 
         # -- Timers -----------------------------------------------------------
         self.create_timer(1.0 / setpoint_rate, self._setpoint_loop)
@@ -198,7 +223,9 @@ class FollowerNode(Node):
             f'FollowerNode ready  drone_id={drone_id}  '
             f'altitude={self.takeoff_altitude}m  '
             f'target_above={self.target_alt_above}m  '
-            f'setpoint={setpoint_rate}Hz  vision={vision_rate}Hz')
+            f'setpoint={setpoint_rate}Hz  vision={vision_rate}Hz  '
+            f'pose_source={self._pose_source}  '
+            f'auto_handoff={self.auto_handoff}')
 
         if self.debug_follow:
             self.flight_state = 'FOLLOW'
@@ -289,13 +316,34 @@ class FollowerNode(Node):
     # == Pose helpers ========================================================
 
     def _get_active_pose(self):
-        """Return best available pose: fresh VICON > T265 > None."""
+        """Return best available pose based on current pose source.
+
+        Before handoff (_pose_source == 'vicon'):
+            VICON primary, T265 fallback.
+        After handoff (_pose_source == 't265'):
+            T265 primary, VICON emergency fallback only (if T265 is None).
+        """
         now = self.get_clock().now()
-        if self.vicon_pose is not None and self.vicon_stamp is not None:
-            age = (now - self.vicon_stamp).nanoseconds * 1e-9
-            if age < self.vicon_timeout:
+        vicon_fresh = (
+            self.vicon_pose is not None
+            and self.vicon_stamp is not None
+            and (now - self.vicon_stamp).nanoseconds * 1e-9 < self.vicon_timeout
+        )
+
+        if self._pose_source == 'vicon':
+            # Pre-handoff: prefer VICON
+            if vicon_fresh:
                 return self.vicon_pose
-        return self.t265_pose
+            return self.t265_pose
+        else:
+            # Post-handoff: prefer T265, VICON only as emergency fallback
+            if self.t265_pose is not None:
+                return self.t265_pose
+            if vicon_fresh:
+                self.get_logger().warn(
+                    'T265 unavailable after handoff -- using VICON fallback')
+                return self.vicon_pose
+            return None
 
     def _get_current_position(self):
         pose = self._get_active_pose()
@@ -534,6 +582,18 @@ class FollowerNode(Node):
                 'Armed in OFFBOARD -- hovering, ready for TEST/FOLLOW')
             self._hover_logged = True
 
+        # -- Auto handoff from VICON to T265 once stable ----------------------
+        if (self.auto_handoff
+                and not self._handoff_done
+                and self.t265_z_auto_offset_done
+                and self.t265_pose is not None):
+            if self._stable_hover_start is None:
+                self._stable_hover_start = now
+            stable_secs = (now - self._stable_hover_start).nanoseconds * 1e-9
+            if stable_secs >= self.handoff_stable_s:
+                self._do_handoff(
+                    f'auto after {stable_secs:.1f}s stable hover')
+
     def _tick_follow(self):
         """Monitor tracking status during FOLLOW."""
         if self.tracking_status == 'LOST' and self.last_good_target is not None:
@@ -583,6 +643,10 @@ class FollowerNode(Node):
         self.hover_start_time        = None
         self.t265_z_auto_offset      = None
         self.t265_z_auto_offset_done = False
+        # Reset pose source back to VICON for next flight (if applicable)
+        self._pose_source = 'vicon' if self.use_vicon else 't265'
+        self._handoff_done = not self.use_vicon
+        self._stable_hover_start = None
 
     # == Course service handlers =============================================
 
@@ -678,6 +742,33 @@ class FollowerNode(Node):
         response.success = True
         response.message = 'Emergency stop executed'
         return response
+
+    def _handle_switch_pose(self, request, response):
+        """Manual service to hand off pose source from VICON to T265."""
+        if self._pose_source == 't265':
+            response.success = True
+            response.message = 'Already using T265'
+            return response
+
+        if self.t265_pose is None:
+            response.success = False
+            response.message = 'Cannot switch: T265 pose not available'
+            return response
+
+        self._do_handoff('manual service call')
+        response.success = True
+        response.message = (
+            f'Switched to T265 (Z offset={self.t265_z_auto_offset or 0:.3f}m)')
+        return response
+
+    def _do_handoff(self, reason):
+        """Switch primary pose source from VICON to T265."""
+        self._pose_source = 't265'
+        self._handoff_done = True
+        z_off = self.t265_z_auto_offset or 0.0
+        self.get_logger().info(
+            f'POSE HANDOFF: VICON -> T265 ({reason})  '
+            f'Z offset={z_off:.3f}m')
 
     # == MAVROS helpers ======================================================
 

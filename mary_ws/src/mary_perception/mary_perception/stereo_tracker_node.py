@@ -34,7 +34,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
@@ -91,7 +91,7 @@ class StereoTrackerNode(Node):
         # Blob detection
         self.declare_parameter('depth_min', 0.5)        # m -- closest valid depth
         self.declare_parameter('depth_max', 2.5)        # m -- farthest valid depth
-        self.declare_parameter('min_blob_area', 500)    # px at half-res
+        self.declare_parameter('min_blob_area', 125)    # px at half-res
         self.declare_parameter('max_blob_count', 5)
 
         # Foreground detection
@@ -159,6 +159,14 @@ class StereoTrackerNode(Node):
         self.frames_without_detection = 0
         self.tracking_status = 'LOST'
 
+        # External state for debug overlay
+        self._flight_state = 'N/A'
+        self._current_pose = None      # PoseStamped
+        self._current_setpoint = None  # PoseStamped
+        self._actual_fps = 0.0
+        self._frame_count = 0
+        self._fps_timer = None
+
         # Video recording (lazy init on first debug frame)
         self._vid_writer = None        # cv2.VideoWriter
         self._vid_path = None
@@ -207,6 +215,17 @@ class StereoTrackerNode(Node):
             self.pub_debug = self.create_publisher(
                 Image, '/mary/tracking/debug', 10)
 
+        # -- Subscribers for debug overlay ------------------------------------
+        self.create_subscription(
+            String, '/mary/comm/flight_state',
+            lambda m: setattr(self, '_flight_state', m.data), 10)
+        self.create_subscription(
+            PoseStamped, '/mary/localization/pose',
+            lambda m: setattr(self, '_current_pose', m), 10)
+        self.create_subscription(
+            PoseStamped, '/mavros/setpoint_position/local',
+            lambda m: setattr(self, '_current_setpoint', m), 10)
+
         self.get_logger().info(
             'StereoTrackerNode initialised -- waiting for calibration')
 
@@ -234,12 +253,28 @@ class StereoTrackerNode(Node):
 
     def _finish_calibration(self):
         ci_l, ci_r = self._ci_left, self._ci_right
-        w, h = ci_l.width, ci_l.height
+        w_full, h_full = ci_l.width, ci_l.height
+
+        # Half-res dimensions for CPU remap (optimization: 4x less remap work)
+        w_half = w_full // 2
+        h_half = h_full // 2
+        self._full_w = w_full
+        self._full_h = h_full
+        self._half_w = w_half
+        self._half_h = h_half
 
         K_left  = np.array(ci_l.k).reshape(3, 3)
         K_right = np.array(ci_r.k).reshape(3, 3)
         D_left  = np.array(ci_l.d[:4])
         D_right = np.array(ci_r.d[:4])
+
+        # Scale intrinsics to half resolution
+        K_left_half  = K_left.copy()
+        K_right_half = K_right.copy()
+        K_left_half[0, :] *= 0.5   # fx, cx
+        K_left_half[1, :] *= 0.5   # fy, cy
+        K_right_half[0, :] *= 0.5
+        K_right_half[1, :] *= 0.5
 
         # Extrinsics: T265 factory-calibrated values from pyrealsense2 EEPROM.
         # (printed by scripts/print_calibration.py — matches realsense_test.py)
@@ -254,44 +289,49 @@ class StereoTrackerNode(Node):
         self.get_logger().info(
             f'Stereo baseline: {self.baseline * 1000:.1f} mm (T265 factory)')
 
+        # Rectify at half resolution
         R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
-            K_left, D_left, K_right, D_right, (w, h), R, T,
+            K_left_half, D_left, K_right_half, D_right,
+            (w_half, h_half), R, T,
             flags=cv2.fisheye.CALIB_ZERO_DISPARITY,
             balance=0.0, fov_scale=1.0,
         )
 
-        # Custom zoom projection (same as realsense_test.py)
-        new_fx = w / 2.0 * self.zoom_factor
-        new_fy = h / 2.0 * self.zoom_factor
+        # Custom zoom projection at half resolution
+        new_fx = w_half / 2.0 * self.zoom_factor
+        new_fy = h_half / 2.0 * self.zoom_factor
         P_custom = np.array([
-            [new_fx, 0,      w / 2.0, 0],
-            [0,      new_fy, h / 2.0, 0],
-            [0,      0,      1,       0],
+            [new_fx, 0,      w_half / 2.0, 0],
+            [0,      new_fy, h_half / 2.0, 0],
+            [0,      0,      1,            0],
         ])
         self.focal_length = new_fx
 
+        # Build remap tables at half resolution
         self.l_map1, self.l_map2 = cv2.fisheye.initUndistortRectifyMap(
-            K_left, D_left, R1, P_custom, (w, h), cv2.CV_16SC2)
+            K_left_half, D_left, R1, P_custom, (w_half, h_half), cv2.CV_16SC2)
         self.r_map1, self.r_map2 = cv2.fisheye.initUndistortRectifyMap(
-            K_right, D_right, R2, P_custom, (w, h), cv2.CV_16SC2)
+            K_right_half, D_right, R2, P_custom, (w_half, h_half), cv2.CV_16SC2)
 
-        # Intrinsics at half resolution (VPI output)
+        # Intrinsics at VPI output resolution (half of half = quarter)
         self.rect_fx = new_fx * 0.5
         self.rect_fy = new_fy * 0.5
-        self.rect_cx = (w / 2.0) * 0.5
-        self.rect_cy = (h / 2.0) * 0.5
+        self.rect_cx = (w_half / 2.0) * 0.5
+        self.rect_cy = (h_half / 2.0) * 0.5
 
         try:
+            # VPI takes half-res as "full", outputs quarter-res
             self.pipeline = VPIStereoPipeline(
-                self.lib_path, w, h, self.max_disp)
+                self.lib_path, w_half, h_half, self.max_disp)
         except Exception as e:
             self.get_logger().error(f'Failed to load VPI pipeline: {e}')
             return
 
         self.calibrated = True
         self.get_logger().info(
-            f'Calibration complete -- {w}x{h} -> '
-            f'{self.pipeline.output_w}x{self.pipeline.output_h}  '
+            f'Calibration complete -- {w_full}x{h_full} -> '
+            f'{w_half}x{h_half} (remap) -> '
+            f'{self.pipeline.output_w}x{self.pipeline.output_h} (VPI)  '
             f'baseline={self.baseline*1000:.1f}mm  f={self.focal_length:.1f}px')
 
     # ------------------------------------------------------------------
@@ -304,9 +344,15 @@ class StereoTrackerNode(Node):
         left  = self.bridge.imgmsg_to_cv2(left_msg,  desired_encoding='mono8')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='mono8')
 
-        # 1. Rectify (CPU)
-        left_rect  = cv2.remap(left,  self.l_map1, self.l_map2, cv2.INTER_LINEAR)
-        right_rect = cv2.remap(right, self.r_map1, self.r_map2, cv2.INTER_LINEAR)
+        # 1. Downsample to half-res (fast, saves 4x remap cost)
+        left_half  = cv2.resize(left,  (self._half_w, self._half_h),
+                                interpolation=cv2.INTER_AREA)
+        right_half = cv2.resize(right, (self._half_w, self._half_h),
+                                interpolation=cv2.INTER_AREA)
+
+        # 2. Rectify at half-res (CPU)
+        left_rect  = cv2.remap(left_half,  self.l_map1, self.l_map2, cv2.INTER_LINEAR)
+        right_rect = cv2.remap(right_half, self.r_map1, self.r_map2, cv2.INTER_LINEAR)
         left_rect  = np.ascontiguousarray(left_rect)
         right_rect = np.ascontiguousarray(right_rect)
 
@@ -453,8 +499,19 @@ class StereoTrackerNode(Node):
     # Debug visualisation
     # ------------------------------------------------------------------
     def _publish_debug(self, depth, detection, header):
+        import time as _time
         h, w = depth.shape[:2]
 
+        # -- FPS tracking -------------------------------------------------
+        self._frame_count += 1
+        now = _time.time()
+        if self._fps_timer is None:
+            self._fps_timer = now
+        elif self._frame_count % 10 == 0:
+            self._actual_fps = 10.0 / max(now - self._fps_timer, 1e-6)
+            self._fps_timer = now
+
+        # -- Depth colormap -----------------------------------------------
         d_vis = np.zeros(depth.shape, dtype=np.uint8)
         valid = depth > 0
         if np.any(valid):
@@ -465,61 +522,68 @@ class StereoTrackerNode(Node):
 
         d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_TURBO)
         WHITE = (255, 255, 255)
+        GREY = (180, 180, 180)
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        S = 0.28  # font scale for 212x200
+        T = 1     # thickness
 
-        # Image center crosshair (drone nadir)
+        # -- Image center crosshair (drone nadir) -------------------------
         cv2.drawMarker(d_color, (w // 2, h // 2), WHITE,
-                        cv2.MARKER_CROSS, 15, 1)
+                        cv2.MARKER_CROSS, 8, 1)
 
-        # Detection marker + control vector
+        # -- Detection marker + control vector ----------------------------
         if detection is not None:
             cx, cy, d = detection
             icx, icy = int(cx), int(cy)
-
-            # White circle on detected blob
-            cv2.circle(d_color, (icx, icy), 10, WHITE, 2)
-            cv2.putText(
-                d_color, f'{d:.2f}m', (icx + 15, icy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
-
-            # Arrow from image center to detection = direction drone would move
+            cv2.circle(d_color, (icx, icy), 5, WHITE, 1)
+            cv2.putText(d_color, f'{d:.2f}m', (icx + 7, icy), F, S, WHITE, T)
             cv2.arrowedLine(d_color, (w // 2, h // 2), (icx, icy),
-                            WHITE, 2, tipLength=0.15)
+                            WHITE, 1, tipLength=0.15)
 
-            # Pixel offset text
-            dx_px = icx - w // 2
-            dy_px = icy - h // 2
-            cv2.putText(
-                d_color, f'px({dx_px:+d},{dy_px:+d})', (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
+        # -- Top-left: status + flight state + FPS ------------------------
+        track_color = WHITE if self.tracking_status == 'TRACKING' else (0, 0, 255)
+        cv2.putText(d_color, self.tracking_status, (3, 10), F, 0.3, track_color, T)
+        cv2.putText(d_color, f'flight: {self._flight_state}', (3, 20), F, S, WHITE, T)
+        cv2.putText(d_color, f'fps: {self._actual_fps:.1f}', (3, 30), F, S, WHITE, T)
 
-        # Body-frame offset from tracked point (what follower receives)
+        # -- Bottom: body offset, pose, setpoint --------------------------
+        y_text = h - 36
+
         if self.tracked_point is not None:
             xb, yb, zb = self.tracked_point
-            cv2.putText(
-                d_color,
-                f'body: fwd={xb:+.2f} rgt={yb:+.2f} dwn={-zb:.2f}m',
-                (10, h - 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
+            cv2.putText(d_color,
+                        f'fwd={xb:+.2f} rgt={yb:+.2f} dwn={-zb:.2f}m',
+                        (3, y_text), F, S, WHITE, T)
+        y_text += 10
 
-        # Status overlay
-        color = WHITE if self.tracking_status == 'TRACKING' \
-            else (0, 0, 255)
-        cv2.putText(
-            d_color, self.tracking_status, (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        if self._current_pose is not None:
+            p = self._current_pose.pose.position
+            cv2.putText(d_color,
+                        f'pos:{p.x:+.1f},{p.y:+.1f},{p.z:+.1f}',
+                        (3, y_text), F, S, WHITE, T)
+        y_text += 10
 
+        if self._current_setpoint is not None:
+            s = self._current_setpoint.pose.position
+            cv2.putText(d_color,
+                        f'spt:{s.x:+.1f},{s.y:+.1f},{s.z:+.1f}',
+                        (3, y_text), F, S, WHITE, T)
+        y_text += 10
+
+        # -- Publish ROS debug image --------------------------------------
         debug_msg = self.bridge.cv2_to_imgmsg(d_color, encoding='bgr8')
         debug_msg.header = header
         self.pub_debug.publish(debug_msg)
 
-        # Write frame directly to video
+        # -- Write frame to video at actual rate --------------------------
         if self.record_video:
             if self._vid_writer is None:
-                h, w = d_color.shape[:2]
+                vid_fps = self._actual_fps if self._actual_fps > 1.0 else 15.0
                 self._vid_writer = cv2.VideoWriter(
                     self._vid_path, cv2.VideoWriter_fourcc(*'H264'),
-                    15.0, (w, h))
-                self.get_logger().info(f'Video writer opened: {w}x{h}')
+                    vid_fps, (w, h))
+                self.get_logger().info(
+                    f'Video writer opened: {w}x{h} @ {vid_fps:.1f}fps')
             self._vid_writer.write(d_color)
 
     # ------------------------------------------------------------------
