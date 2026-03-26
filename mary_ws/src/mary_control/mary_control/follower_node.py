@@ -6,7 +6,7 @@ Follows a tracked target using position setpoints.  Built on the proven
 waypoint_node.py patterns (FT2/FT3) with tracking-specific logic.
 
 Flight state machine:
-    IDLE  ->  LAUNCH  ->  FOLLOW  <->  HOVER  ->  LAND  |  ABORT
+    IDLE  ->  LAUNCH  ->  FOLLOW  <->  COAST  ->  HOVER  ->  LAND  |  ABORT
 
 Pose source handoff:
     In part=1 (VICON mode), the drone takes off using VICON for reliable
@@ -66,6 +66,7 @@ class FollowerNode(Node):
         self.declare_parameter('t265_z_offset',         0.0)      # m
         self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
         self.declare_parameter('max_follow_speed',      1.5)      # m/s rate limit
+        self.declare_parameter('coast_duration',         2.0)      # s to coast before hovering
         self.declare_parameter('auto_handoff',          False)    # auto switch to T265 after Z cal
         self.declare_parameter('handoff_stable_secs',   3.0)     # s of stable hover before auto handoff
         self.declare_parameter('log_euler',             False)
@@ -86,6 +87,7 @@ class FollowerNode(Node):
         self.t265_z_offset     = self.get_parameter('t265_z_offset').value
         self.hover_timeout     = self.get_parameter('hover_timeout').value
         self.max_follow_speed  = self.get_parameter('max_follow_speed').value
+        self.coast_duration    = self.get_parameter('coast_duration').value
         self.auto_handoff      = self.get_parameter('auto_handoff').value
         self.handoff_stable_s  = self.get_parameter('handoff_stable_secs').value
         self.log_euler         = self.get_parameter('log_euler').value
@@ -127,9 +129,14 @@ class FollowerNode(Node):
         # -- Tracking state ---------------------------------------------------
         self.tracking_offset    = None       # latest PointStamped from tracker
         self.tracking_status    = 'LOST'
+        self.coast_start_time   = None       # when COAST was entered
+        self.coast_velocity     = None       # np.array([vx, vy]) m/s at coast entry
+        self.coast_origin       = None       # np.array([x, y, z]) position at coast entry
         self.hover_start_time   = None       # when HOVER was entered
         self.follow_target      = None       # PoseStamped in world frame
         self.last_good_target   = None       # last valid target for HOVER hold
+        self._prev_target_pos   = None       # for velocity estimation
+        self._prev_target_stamp = None       # timestamp of prev target
 
         # -- Vicon body-frame correction (same as waypoint_node) ---------------
         self.use_vicon = bool(vicon_topic)
@@ -462,6 +469,21 @@ class FollowerNode(Node):
                         target.pose.position.x = pos[0] + dx * scale
                         target.pose.position.y = pos[1] + dy * scale
 
+                # Track velocity for coasting
+                now_time = self.get_clock().now()
+                tp = np.array([target.pose.position.x, target.pose.position.y])
+                if self._prev_target_pos is not None and self._prev_target_stamp is not None:
+                    dt_vel = (now_time - self._prev_target_stamp).nanoseconds * 1e-9
+                    if dt_vel > 0.01:
+                        vel = (tp - self._prev_target_pos) / dt_vel
+                        # EMA smooth the velocity estimate
+                        if self.coast_velocity is not None:
+                            self.coast_velocity = 0.5 * vel + 0.5 * self.coast_velocity
+                        else:
+                            self.coast_velocity = vel
+                self._prev_target_pos = tp
+                self._prev_target_stamp = now_time
+
                 self.follow_target = target
                 self.last_good_target = target
                 msg.pose = target.pose
@@ -469,6 +491,24 @@ class FollowerNode(Node):
                 msg.pose = self.last_good_target.pose
             elif self.hover_pose is not None:
                 msg.pose = self.hover_pose.pose
+            else:
+                self._fill_default_setpoint(msg)
+
+        elif self.flight_state == 'COAST':
+            # Extrapolate along the velocity vector from coast entry
+            if self.coast_origin is not None and self.coast_velocity is not None:
+                elapsed = (self.get_clock().now()
+                           - self.coast_start_time).nanoseconds * 1e-9
+                extrap = self.coast_origin[:2] + self.coast_velocity * elapsed
+                msg.pose.position.x = float(extrap[0])
+                msg.pose.position.y = float(extrap[1])
+                msg.pose.position.z = float(self.coast_origin[2])
+                if self.last_good_target is not None:
+                    msg.pose.orientation = self.last_good_target.pose.orientation
+                else:
+                    msg.pose.orientation.w = 1.0
+            elif self.last_good_target is not None:
+                msg.pose = self.last_good_target.pose
             else:
                 self._fill_default_setpoint(msg)
 
@@ -528,7 +568,7 @@ class FollowerNode(Node):
     def _state_machine_loop(self):
         # RC override / external disarm detection
         if (self._offboard_achieved
-                and self.flight_state in ('LAUNCH', 'FOLLOW', 'HOVER', 'LAND')
+                and self.flight_state in ('LAUNCH', 'FOLLOW', 'COAST', 'HOVER', 'LAND')
                 and self.mavros_state is not None):
             if self.mavros_state.mode != 'OFFBOARD':
                 self.get_logger().info(
@@ -544,6 +584,8 @@ class FollowerNode(Node):
             self._tick_launch()
         elif self.flight_state == 'FOLLOW':
             self._tick_follow()
+        elif self.flight_state == 'COAST':
+            self._tick_coast()
         elif self.flight_state == 'HOVER':
             self._tick_hover()
         elif self.flight_state == 'LAND':
@@ -598,12 +640,46 @@ class FollowerNode(Node):
     def _tick_follow(self):
         """Monitor tracking status during FOLLOW."""
         if self.tracking_status == 'LOST' and self.last_good_target is not None:
-            # Only transition to HOVER if we had tracking before and lost it.
-            # Don't transition if we never had tracking (e.g. startup).
-            self.get_logger().info('Tracking lost -- entering HOVER')
+            # Lost tracking — coast along velocity vector before hovering.
+            p = self.last_good_target.pose.position
+            self.coast_origin = np.array([p.x, p.y, p.z])
+            speed = np.linalg.norm(self.coast_velocity) if self.coast_velocity is not None else 0.0
+            self.get_logger().info(
+                f'Tracking lost -- coasting at {speed:.2f} m/s')
+            self.flight_state = 'COAST'
+            self.coast_start_time = self.get_clock().now()
+
+    def _tick_coast(self):
+        """Extrapolate along velocity vector for coast_duration, then HOVER."""
+        if self.tracking_status == 'TRACKING':
+            self.get_logger().info('Tracking recovered during coast -- resuming FOLLOW')
+            self.flight_state = 'FOLLOW'
+            self.coast_start_time = None
+            return
+
+        elapsed = (self.get_clock().now()
+                   - self.coast_start_time).nanoseconds * 1e-9
+        if elapsed >= self.coast_duration:
+            # Hover at the extrapolated position (where the drone ends up)
+            hover = PoseStamped()
+            if self.coast_origin is not None and self.coast_velocity is not None:
+                extrap = self.coast_origin[:2] + self.coast_velocity * elapsed
+                hover.pose.position.x = float(extrap[0])
+                hover.pose.position.y = float(extrap[1])
+                hover.pose.position.z = float(self.coast_origin[2])
+            elif self.last_good_target is not None:
+                hover.pose = self.last_good_target.pose
+            if self.last_good_target is not None:
+                hover.pose.orientation = self.last_good_target.pose.orientation
+            else:
+                hover.pose.orientation.w = 1.0
+
+            self.get_logger().info(
+                f'Coast expired ({elapsed:.1f}s) -- entering HOVER')
             self.flight_state = 'HOVER'
             self.hover_start_time = self.get_clock().now()
-            self.hover_pose = self.last_good_target
+            self.hover_pose = hover
+            self.coast_start_time = None
 
     def _tick_hover(self):
         """Wait for tracking recovery or timeout to auto-land."""
@@ -641,6 +717,11 @@ class FollowerNode(Node):
         self._landed_logged          = False
         self.follow_target           = None
         self.last_good_target        = None
+        self.coast_start_time        = None
+        self.coast_velocity          = None
+        self.coast_origin            = None
+        self._prev_target_pos        = None
+        self._prev_target_stamp      = None
         self.hover_start_time        = None
         self.t265_z_auto_offset      = None
         self.t265_z_auto_offset_done = False
@@ -689,7 +770,7 @@ class FollowerNode(Node):
 
         Uses the 'test' service name for course interface compatibility.
         """
-        if self.flight_state not in ('LAUNCH', 'FOLLOW', 'HOVER'):
+        if self.flight_state not in ('LAUNCH', 'FOLLOW', 'COAST', 'HOVER'):
             response.success = False
             response.message = f'Cannot follow: state={self.flight_state}'
             return response
