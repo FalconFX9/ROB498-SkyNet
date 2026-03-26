@@ -79,6 +79,7 @@ class T265PoseNode(Node):
         self.current_pose = None
         self.initial_pose = None  # For zeroing position at start
         self.pose_initialized = False
+        self._latest_odom = None  # Raw Odometry stored by 200Hz callback
 
         # Orientation zeroing: collect samples then compute inverse
         self._orient_samples = []          # list of [x, y, z, w] quaternions
@@ -117,7 +118,21 @@ class T265PoseNode(Node):
         self.get_logger().info(f'  Publishing to MAVROS at {publish_rate} Hz')
 
     def pose_callback(self, msg: Odometry):
-        """Process incoming T265 pose."""
+        """Store latest T265 pose — heavy math is deferred to the 30 Hz timer.
+
+        During initialization (first ~100 samples), we collect orientation
+        samples directly here at 200 Hz so zeroing completes quickly (~0.5 s).
+        """
+        if not self.pose_initialized:
+            self._process_odom(msg)
+            return
+        self._latest_odom = msg
+
+    def _process_odom(self, msg: Odometry):
+        """Process a single Odometry message: init, transform, store.
+
+        Called from the 30 Hz publish_pose timer, NOT from the 200 Hz callback.
+        """
         # Extract position
         position = np.array([
             msg.pose.pose.position.x,
@@ -180,10 +195,10 @@ class T265PoseNode(Node):
             'header': msg.header
         }
 
-        # Publish debug RPY (~10 Hz from ~200 Hz callback)
+        # Publish debug RPY (~2 Hz from 30 Hz timer)
         if self.log_euler:
             self._euler_log_counter += 1
-            if self._euler_log_counter % 20 == 0:
+            if self._euler_log_counter % 15 == 0:
                 stamp = self.get_clock().now().to_msg()
                 raw_rpy = np.degrees(tf_transformations.euler_from_quaternion(orientation))
                 out_rpy = np.degrees(tf_transformations.euler_from_quaternion(
@@ -245,7 +260,13 @@ class T265PoseNode(Node):
         }
 
     def publish_pose(self):
-        """Publish current pose at fixed rate."""
+        """Process latest odom and publish current pose at fixed rate."""
+        # Process the most recent raw Odometry (all transforms run here at 30 Hz)
+        odom = self._latest_odom
+        if odom is not None:
+            self._latest_odom = None
+            self._process_odom(odom)
+
         if self.current_pose is None:
             return
 

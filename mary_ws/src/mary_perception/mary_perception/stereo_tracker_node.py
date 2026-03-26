@@ -83,7 +83,7 @@ class StereoTrackerNode(Node):
             'libstereo_path',
             os.path.expanduser(
                 '~/Documents/SkyNet/ROB498-SkyNet/scripts/libstereo.so'))
-        self.declare_parameter('max_disparity', 256)
+        self.declare_parameter('max_disparity', 64)
         self.declare_parameter('zoom_factor', 1.5)
         self.declare_parameter('median_filter_size', 3)
         self.declare_parameter('publish_debug', True)
@@ -202,8 +202,10 @@ class StereoTrackerNode(Node):
             self, Image, '/camera/fisheye1/image_raw', qos_profile=sensor_qos)
         sub_right = message_filters.Subscriber(
             self, Image, '/camera/fisheye2/image_raw', qos_profile=sensor_qos)
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [sub_left, sub_right], queue_size=5, slop=0.02)
+        # T265 hardware-syncs both fisheye frames with identical stamps,
+        # so use exact TimeSynchronizer for O(1) matching (no slop search).
+        self.sync = message_filters.TimeSynchronizer(
+            [sub_left, sub_right], queue_size=5)
         self.sync.registerCallback(self._stereo_cb)
 
         # -- Publishers -------------------------------------------------------
@@ -263,18 +265,12 @@ class StereoTrackerNode(Node):
         self._half_w = w_half
         self._half_h = h_half
 
+        # Use full-res intrinsics + distortion so initUndistortRectifyMap
+        # handles both undistortion AND downsampling in a single remap pass.
         K_left  = np.array(ci_l.k).reshape(3, 3)
         K_right = np.array(ci_r.k).reshape(3, 3)
         D_left  = np.array(ci_l.d[:4])
         D_right = np.array(ci_r.d[:4])
-
-        # Scale intrinsics to half resolution
-        K_left_half  = K_left.copy()
-        K_right_half = K_right.copy()
-        K_left_half[0, :] *= 0.5   # fx, cx
-        K_left_half[1, :] *= 0.5   # fy, cy
-        K_right_half[0, :] *= 0.5
-        K_right_half[1, :] *= 0.5
 
         # Extrinsics: T265 factory-calibrated values from pyrealsense2 EEPROM.
         # (printed by scripts/print_calibration.py — matches realsense_test.py)
@@ -289,7 +285,10 @@ class StereoTrackerNode(Node):
         self.get_logger().info(
             f'Stereo baseline: {self.baseline * 1000:.1f} mm (T265 factory)')
 
-        # Rectify at half resolution
+        # Rectify using full-res K for stereoRectify (defines the geometry)
+        # but we scale K by 0.5 only for stereoRectify's size parameter
+        K_left_half  = K_left.copy();  K_left_half[0, :] *= 0.5;  K_left_half[1, :] *= 0.5
+        K_right_half = K_right.copy(); K_right_half[0, :] *= 0.5; K_right_half[1, :] *= 0.5
         R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
             K_left_half, D_left, K_right_half, D_right,
             (w_half, h_half), R, T,
@@ -307,17 +306,25 @@ class StereoTrackerNode(Node):
         ])
         self.focal_length = new_fx
 
-        # Build remap tables at half resolution
+        # Build remap tables: full-res K/D -> half-res output in one pass.
+        # This fuses undistortion + downsampling, eliminating cv2.resize.
         self.l_map1, self.l_map2 = cv2.fisheye.initUndistortRectifyMap(
-            K_left_half, D_left, R1, P_custom, (w_half, h_half), cv2.CV_16SC2)
+            K_left, D_left, R1, P_custom, (w_half, h_half), cv2.CV_16SC2)
         self.r_map1, self.r_map2 = cv2.fisheye.initUndistortRectifyMap(
-            K_right_half, D_right, R2, P_custom, (w_half, h_half), cv2.CV_16SC2)
+            K_right, D_right, R2, P_custom, (w_half, h_half), cv2.CV_16SC2)
 
         # Intrinsics at VPI output resolution (half of half = quarter)
         self.rect_fx = new_fx * 0.5
         self.rect_fy = new_fy * 0.5
         self.rect_cx = (w_half / 2.0) * 0.5
         self.rect_cy = (h_half / 2.0) * 0.5
+
+        # Pre-allocate reusable buffers to avoid per-frame GC pressure
+        self._left_rect_buf  = np.empty((h_half, w_half), dtype=np.uint8)
+        self._right_rect_buf = np.empty((h_half, w_half), dtype=np.uint8)
+        vpi_out_h, vpi_out_w = h_half // 2, w_half // 2
+        self._d_float_buf = np.empty((vpi_out_h, vpi_out_w), dtype=np.float32)
+        self._depth_buf   = np.zeros((vpi_out_h, vpi_out_w), dtype=np.float32)
 
         try:
             # VPI takes half-res as "full", outputs quarter-res
@@ -344,17 +351,14 @@ class StereoTrackerNode(Node):
         left  = self.bridge.imgmsg_to_cv2(left_msg,  desired_encoding='mono8')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='mono8')
 
-        # 1. Downsample to half-res (fast, saves 4x remap cost)
-        left_half  = cv2.resize(left,  (self._half_w, self._half_h),
-                                interpolation=cv2.INTER_AREA)
-        right_half = cv2.resize(right, (self._half_w, self._half_h),
-                                interpolation=cv2.INTER_AREA)
-
-        # 2. Rectify at half-res (CPU)
-        left_rect  = cv2.remap(left_half,  self.l_map1, self.l_map2, cv2.INTER_LINEAR)
-        right_rect = cv2.remap(right_half, self.r_map1, self.r_map2, cv2.INTER_LINEAR)
-        left_rect  = np.ascontiguousarray(left_rect)
-        right_rect = np.ascontiguousarray(right_rect)
+        # 1+2. Fused undistort + downsample + rectify in one remap pass (CPU).
+        #       Maps were built with full-res K/D -> half-res output.
+        cv2.remap(left,  self.l_map1, self.l_map2, cv2.INTER_LINEAR,
+                  dst=self._left_rect_buf)
+        cv2.remap(right, self.r_map1, self.r_map2, cv2.INTER_LINEAR,
+                  dst=self._right_rect_buf)
+        left_rect  = self._left_rect_buf
+        right_rect = self._right_rect_buf
 
         # 2. VPI stereo (GPU)
         d_raw = self.pipeline.compute(left_rect, right_rect)
@@ -363,11 +367,14 @@ class StereoTrackerNode(Node):
         if self.median_ks > 0:
             d_raw = cv2.medianBlur(d_raw, self.median_ks)
 
-        # 4. Disparity -> depth
-        d_float = d_raw.astype(np.float32) / 32.0  # Q10.5 -> pixel disparity
-        depth = np.zeros_like(d_float)
+        # 4. Disparity -> depth (in-place, no allocation)
+        np.copyto(self._d_float_buf, d_raw, casting='unsafe')
+        self._d_float_buf *= (1.0 / 32.0)  # Q10.5 -> pixel disparity
+        d_float = self._d_float_buf
+        depth = self._depth_buf
+        depth[:] = 0.0
         valid = d_float > 0.5
-        depth[valid] = (self.baseline * self.rect_fx) / d_float[valid]
+        np.divide(self.baseline * self.rect_fx, d_float, out=depth, where=valid)
 
         # 5. Blob detection on depth band
         detection = self._detect_blob(depth)
@@ -579,13 +586,27 @@ class StereoTrackerNode(Node):
         debug_msg.header = header
         self.pub_debug.publish(debug_msg)
 
-        # -- Write frame to video at actual rate --------------------------
+        # -- Write frame to video via Jetson HW encoder --------------------
         if self.record_video:
             if self._vid_writer is None:
                 vid_fps = self._actual_fps if self._actual_fps > 1.0 else 15.0
+                gst_pipe = (
+                    f'appsrc ! video/x-raw,format=BGR ! videoconvert ! '
+                    f'video/x-raw,format=BGRx ! nvvidconv ! '
+                    f'video/x-raw(memory:NVMM),format=NV12 ! '
+                    f'nvv4l2h264enc bitrate=2000000 preset-level=1 ! '
+                    f'h264parse ! matroskamux ! '
+                    f'filesink location={self._vid_path}'
+                )
                 self._vid_writer = cv2.VideoWriter(
-                    self._vid_path, cv2.VideoWriter_fourcc(*'H264'),
-                    vid_fps, (w, h))
+                    gst_pipe, cv2.CAP_GSTREAMER,
+                    0, vid_fps, (w, h))
+                if not self._vid_writer.isOpened():
+                    self.get_logger().warn(
+                        'GStreamer HW encoder failed, falling back to CPU H264')
+                    self._vid_writer = cv2.VideoWriter(
+                        self._vid_path, cv2.VideoWriter_fourcc(*'H264'),
+                        vid_fps, (w, h))
                 self.get_logger().info(
                     f'Video writer opened: {w}x{h} @ {vid_fps:.1f}fps')
             self._vid_writer.write(d_color)
