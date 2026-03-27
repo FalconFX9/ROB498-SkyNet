@@ -498,6 +498,10 @@ class FollowerNode(Node):
                     if dt_vel > 0.01:
                         raw_vel = (tp - self._prev_target_pos) / dt_vel
                         self._follow_velocity = 0.5 * raw_vel + 0.5 * self._follow_velocity
+                        # Clamp to max_follow_speed (horizontal magnitude)
+                        horiz_speed = np.linalg.norm(self._follow_velocity[:2])
+                        if horiz_speed > self.max_follow_speed:
+                            self._follow_velocity[:2] *= self.max_follow_speed / horiz_speed
                         # Keep 2D coast_velocity in sync
                         self.coast_velocity = self._follow_velocity[:2].copy()
 
