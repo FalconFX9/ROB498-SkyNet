@@ -67,6 +67,10 @@ class FollowerNode(Node):
         self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
         self.declare_parameter('max_follow_speed',      2.5)      # m/s rate limit
         self.declare_parameter('coast_duration',         2.0)      # s to coast before hovering
+        self.declare_parameter('pid_kp',                0.8)      # velocity PID proportional gain
+        self.declare_parameter('pid_ki',                0.05)     # velocity PID integral gain
+        self.declare_parameter('pid_kd',                0.1)      # velocity PID derivative gain
+        self.declare_parameter('pid_i_max',             0.5)      # integral windup clamp (m/s equiv)
         self.declare_parameter('auto_handoff',          False)    # auto switch to T265 after Z cal
         self.declare_parameter('handoff_stable_secs',   3.0)     # s of stable hover before auto handoff
         self.declare_parameter('log_euler',             False)
@@ -88,6 +92,10 @@ class FollowerNode(Node):
         self.hover_timeout     = self.get_parameter('hover_timeout').value
         self.max_follow_speed  = self.get_parameter('max_follow_speed').value
         self.coast_duration    = self.get_parameter('coast_duration').value
+        self.pid_kp            = self.get_parameter('pid_kp').value
+        self.pid_ki            = self.get_parameter('pid_ki').value
+        self.pid_kd            = self.get_parameter('pid_kd').value
+        self.pid_i_max         = self.get_parameter('pid_i_max').value
         self.auto_handoff      = self.get_parameter('auto_handoff').value
         self.handoff_stable_s  = self.get_parameter('handoff_stable_secs').value
         self.log_euler         = self.get_parameter('log_euler').value
@@ -135,10 +143,11 @@ class FollowerNode(Node):
         self.hover_start_time   = None       # when HOVER was entered
         self.follow_target      = None       # PoseStamped in world frame
         self.last_good_target   = None       # last valid target for HOVER hold
-        self._prev_target_pos   = None       # for velocity estimation (3D)
-        self._prev_target_stamp = None       # timestamp of prev target
-        self._follow_velocity   = np.zeros(3)  # EMA velocity feedforward (m/s)
+        self._follow_velocity   = np.zeros(3)  # PID velocity feedforward (m/s)
         self._follow_yaw        = None       # locked yaw at FOLLOW entry (rad)
+        self._pid_integral      = np.zeros(2)  # accumulated horizontal error
+        self._pid_prev_error    = None       # previous horizontal error for D term
+        self._pid_prev_time     = None       # timestamp of previous PID tick
 
         # -- Vicon body-frame correction (same as waypoint_node) ---------------
         self.use_vicon = bool(vicon_topic)
@@ -492,21 +501,41 @@ class FollowerNode(Node):
                     target.pose.position.z,
                 ])
 
-                # Compute 3D velocity feedforward via EMA
-                if self._prev_target_pos is not None and self._prev_target_stamp is not None:
-                    dt_vel = (now - self._prev_target_stamp).nanoseconds * 1e-9
-                    if dt_vel > 0.01:
-                        raw_vel = (tp - self._prev_target_pos) / dt_vel
-                        self._follow_velocity = 0.5 * raw_vel + 0.5 * self._follow_velocity
-                        # Clamp to max_follow_speed (horizontal magnitude)
-                        horiz_speed = np.linalg.norm(self._follow_velocity[:2])
-                        if horiz_speed > self.max_follow_speed:
-                            self._follow_velocity[:2] *= self.max_follow_speed / horiz_speed
-                        # Keep 2D coast_velocity in sync
-                        self.coast_velocity = self._follow_velocity[:2].copy()
+                # PID velocity feedforward on horizontal position error
+                cur_pos = self._get_current_position()
+                if cur_pos is not None:
+                    error = tp[:2] - cur_pos[:2]
 
-                self._prev_target_pos   = tp
-                self._prev_target_stamp = now
+                    p_term = self.pid_kp * error
+
+                    d_term = np.zeros(2)
+                    if (self._pid_prev_error is not None
+                            and self._pid_prev_time is not None):
+                        dt_pid = (now - self._pid_prev_time).nanoseconds * 1e-9
+                        if 0.01 < dt_pid < 0.5:
+                            d_term = self.pid_kd * (error - self._pid_prev_error) / dt_pid
+                            self._pid_integral += error * dt_pid
+                            # Clamp integral windup
+                            i_mag = np.linalg.norm(self._pid_integral)
+                            if i_mag > 0.0:
+                                i_limit = self.pid_i_max / max(self.pid_ki, 1e-6)
+                                if i_mag > i_limit:
+                                    self._pid_integral *= i_limit / i_mag
+
+                    i_term = self.pid_ki * self._pid_integral
+                    vel_xy = p_term + i_term + d_term
+
+                    # Clamp horizontal speed to max_follow_speed
+                    speed = np.linalg.norm(vel_xy)
+                    if speed > self.max_follow_speed:
+                        vel_xy *= self.max_follow_speed / speed
+
+                    self._follow_velocity[:2] = vel_xy
+                    self._follow_velocity[2]  = 0.0  # Z handled by position setpoint
+                    self.coast_velocity = vel_xy.copy()
+
+                    self._pid_prev_error = error
+                    self._pid_prev_time  = now
 
                 self.follow_target    = target
                 self.last_good_target = target
@@ -612,6 +641,13 @@ class FollowerNode(Node):
             return np.array([p.x, p.y, p.z]), yaw
         return np.array([0.0, 0.0, self.takeoff_altitude]), 0.0
 
+    def _reset_pid(self):
+        """Clear PID state. Call whenever entering or re-entering FOLLOW."""
+        self._pid_integral   = np.zeros(2)
+        self._pid_prev_error = None
+        self._pid_prev_time  = None
+        self._follow_velocity = np.zeros(3)
+
     def _broadcast_state(self):
         msg      = String()
         msg.data = self.flight_state
@@ -707,6 +743,7 @@ class FollowerNode(Node):
         """Extrapolate along velocity vector for coast_duration, then HOVER."""
         if self.tracking_status == 'TRACKING':
             self.get_logger().info('Tracking recovered during coast -- resuming FOLLOW')
+            self._reset_pid()
             self.flight_state = 'FOLLOW'
             self.coast_start_time = None
             return
@@ -739,6 +776,7 @@ class FollowerNode(Node):
         """Wait for tracking recovery or timeout to auto-land."""
         if self.tracking_status == 'TRACKING':
             self.get_logger().info('Tracking recovered -- resuming FOLLOW')
+            self._reset_pid()
             self.flight_state = 'FOLLOW'
             self.hover_start_time = None
             return
@@ -830,6 +868,7 @@ class FollowerNode(Node):
             return response
 
         self._follow_yaw = self._get_current_yaw()
+        self._reset_pid()
         self.flight_state = 'FOLLOW'
         self.get_logger().info(
             f'FOLLOW -- tracking target  locked_yaw={np.degrees(self._follow_yaw):.1f}deg')
