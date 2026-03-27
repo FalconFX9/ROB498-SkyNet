@@ -38,7 +38,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
 
 from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
-from mavros_msgs.msg import State
+from mavros_msgs.msg import State, PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -65,7 +65,7 @@ class FollowerNode(Node):
         self.declare_parameter('vicon_yaw_offset',      0.0)      # rad
         self.declare_parameter('t265_z_offset',         0.0)      # m
         self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
-        self.declare_parameter('max_follow_speed',      1.5)      # m/s rate limit
+        self.declare_parameter('max_follow_speed',      2.5)      # m/s rate limit
         self.declare_parameter('coast_duration',         2.0)      # s to coast before hovering
         self.declare_parameter('auto_handoff',          False)    # auto switch to T265 after Z cal
         self.declare_parameter('handoff_stable_secs',   3.0)     # s of stable hover before auto handoff
@@ -135,8 +135,10 @@ class FollowerNode(Node):
         self.hover_start_time   = None       # when HOVER was entered
         self.follow_target      = None       # PoseStamped in world frame
         self.last_good_target   = None       # last valid target for HOVER hold
-        self._prev_target_pos   = None       # for velocity estimation
+        self._prev_target_pos   = None       # for velocity estimation (3D)
         self._prev_target_stamp = None       # timestamp of prev target
+        self._follow_velocity   = np.zeros(3)  # EMA velocity feedforward (m/s)
+        self._follow_yaw        = None       # locked yaw at FOLLOW entry (rad)
 
         # -- Vicon body-frame correction (same as waypoint_node) ---------------
         self.use_vicon = bool(vicon_topic)
@@ -199,7 +201,7 @@ class FollowerNode(Node):
             PoseStamped, '/mavros/vision_pose/pose',
             qos_profile_system_default)
         self.setpoint_pub = self.create_publisher(
-            PoseStamped, '/mavros/setpoint_position/local',
+            PositionTarget, '/mavros/setpoint_raw/local',
             qos_profile_system_default)
         self.state_pub = self.create_publisher(
             String, '/mary/comm/flight_state', 10)
@@ -236,6 +238,7 @@ class FollowerNode(Node):
             f'auto_handoff={self.auto_handoff}')
 
         if self.debug_follow:
+            self._follow_yaw = 0.0
             self.flight_state = 'FOLLOW'
             self._offboard_achieved = True
             self.hover_pose = PoseStamped()
@@ -441,122 +444,169 @@ class FollowerNode(Node):
     # == Setpoint publishing =================================================
 
     def _setpoint_loop(self):
-        """Publish position setpoints at fixed rate.
+        """Publish position+velocity setpoints at fixed rate.
 
-        FOLLOW  -> fly toward tracked person (rate-limited)
-        HOVER   -> hold last good target position
+        FOLLOW      -> fly toward tracked person with velocity feedforward
+        COAST       -> extrapolate along last velocity vector
+        HOVER       -> hold last good target position
         IDLE/LAUNCH -> hold hover_pose
-        LAND    -> ramp Z toward ground
-        ABORT   -> stop publishing
+        LAND        -> ramp Z toward ground
+        ABORT       -> stop publishing
+
+        type_mask constants (set bit = ignore field):
+          MASK_POS_YAW     = 3064  ignore vel, accel, yaw_rate
+          MASK_POS_VEL_YAW = 3008  ignore accel, yaw_rate (use pos+vel+yaw)
         """
-        msg = PoseStamped()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
+        MASK_POS_YAW     = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
+                            PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
+                            PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                            PositionTarget.IGNORE_YAW_RATE)
+        MASK_POS_VEL_YAW = (PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY |
+                            PositionTarget.IGNORE_AFZ | PositionTarget.IGNORE_YAW_RATE)
+
+        now   = self.get_clock().now()
+        stamp = now.to_msg()
+
+        pos  = None   # np.array [x, y, z]
+        yaw  = 0.0
+        vel  = None   # np.array [vx, vy, vz], only set in FOLLOW
 
         if self.flight_state == 'FOLLOW':
             target = self._compute_follow_target()
             if target is not None:
                 # Rate-limit horizontal position change for safety
-                pos = self._get_current_position()
-                if pos is not None:
-                    dx = target.pose.position.x - pos[0]
-                    dy = target.pose.position.y - pos[1]
+                cur_pos = self._get_current_position()
+                if cur_pos is not None:
+                    dx = target.pose.position.x - cur_pos[0]
+                    dy = target.pose.position.y - cur_pos[1]
                     dist = np.sqrt(dx*dx + dy*dy)
-                    dt = 1.0 / self.setpoint_rate
-                    max_step = self.max_follow_speed * dt
+                    max_step = self.max_follow_speed / self.setpoint_rate
                     if dist > max_step:
                         scale = max_step / dist
-                        target.pose.position.x = pos[0] + dx * scale
-                        target.pose.position.y = pos[1] + dy * scale
+                        target.pose.position.x = cur_pos[0] + dx * scale
+                        target.pose.position.y = cur_pos[1] + dy * scale
 
-                # Track velocity for coasting
-                now_time = self.get_clock().now()
-                tp = np.array([target.pose.position.x, target.pose.position.y])
+                tp = np.array([
+                    target.pose.position.x,
+                    target.pose.position.y,
+                    target.pose.position.z,
+                ])
+
+                # Compute 3D velocity feedforward via EMA
                 if self._prev_target_pos is not None and self._prev_target_stamp is not None:
-                    dt_vel = (now_time - self._prev_target_stamp).nanoseconds * 1e-9
+                    dt_vel = (now - self._prev_target_stamp).nanoseconds * 1e-9
                     if dt_vel > 0.01:
-                        vel = (tp - self._prev_target_pos) / dt_vel
-                        # EMA smooth the velocity estimate
-                        if self.coast_velocity is not None:
-                            self.coast_velocity = 0.5 * vel + 0.5 * self.coast_velocity
-                        else:
-                            self.coast_velocity = vel
-                self._prev_target_pos = tp
-                self._prev_target_stamp = now_time
+                        raw_vel = (tp - self._prev_target_pos) / dt_vel
+                        self._follow_velocity = 0.5 * raw_vel + 0.5 * self._follow_velocity
+                        # Keep 2D coast_velocity in sync
+                        self.coast_velocity = self._follow_velocity[:2].copy()
 
-                self.follow_target = target
+                self._prev_target_pos   = tp
+                self._prev_target_stamp = now
+
+                self.follow_target    = target
                 self.last_good_target = target
-                msg.pose = target.pose
-            elif self.last_good_target is not None:
-                msg.pose = self.last_good_target.pose
-            elif self.hover_pose is not None:
-                msg.pose = self.hover_pose.pose
+
+                pos = tp
+                yaw = self._follow_yaw if self._follow_yaw is not None else self._get_current_yaw()
+                vel = self._follow_velocity.copy()
             else:
-                self._fill_default_setpoint(msg)
+                # No fresh target — hold last known without velocity
+                if self.last_good_target is not None:
+                    p = self.last_good_target.pose.position
+                    pos = np.array([p.x, p.y, p.z])
+                else:
+                    pos, _ = self._default_pos_yaw()
+                yaw = self._follow_yaw if self._follow_yaw is not None else self._get_current_yaw()
 
         elif self.flight_state == 'COAST':
-            # Extrapolate along the velocity vector from coast entry
             if self.coast_origin is not None and self.coast_velocity is not None:
-                elapsed = (self.get_clock().now()
-                           - self.coast_start_time).nanoseconds * 1e-9
-                extrap = self.coast_origin[:2] + self.coast_velocity * elapsed
-                msg.pose.position.x = float(extrap[0])
-                msg.pose.position.y = float(extrap[1])
-                msg.pose.position.z = float(self.coast_origin[2])
-                if self.last_good_target is not None:
-                    msg.pose.orientation = self.last_good_target.pose.orientation
-                else:
-                    msg.pose.orientation.w = 1.0
+                elapsed = (now - self.coast_start_time).nanoseconds * 1e-9
+                extrap  = self.coast_origin[:2] + self.coast_velocity * elapsed
+                pos = np.array([float(extrap[0]), float(extrap[1]),
+                                float(self.coast_origin[2])])
             elif self.last_good_target is not None:
-                msg.pose = self.last_good_target.pose
+                p = self.last_good_target.pose.position
+                pos = np.array([p.x, p.y, p.z])
             else:
-                self._fill_default_setpoint(msg)
+                pos, yaw = self._default_pos_yaw()
+            if self.last_good_target is not None:
+                q = self.last_good_target.pose.orientation
+                _, _, yaw = tf_transformations.euler_from_quaternion(
+                    [q.x, q.y, q.z, q.w])
 
         elif self.flight_state == 'HOVER':
             if self.last_good_target is not None:
-                msg.pose = self.last_good_target.pose
-            elif self.hover_pose is not None:
-                msg.pose = self.hover_pose.pose
+                p = self.last_good_target.pose.position
+                q = self.last_good_target.pose.orientation
+                pos = np.array([p.x, p.y, p.z])
+                _, _, yaw = tf_transformations.euler_from_quaternion(
+                    [q.x, q.y, q.z, q.w])
             else:
-                self._fill_default_setpoint(msg)
+                pos, yaw = self._default_pos_yaw()
 
         elif self.flight_state in ('IDLE', 'LAUNCH'):
-            if self.hover_pose is not None:
-                msg.pose = self.hover_pose.pose
-            else:
-                self._fill_default_setpoint(msg)
+            pos, yaw = self._default_pos_yaw()
 
         elif self.flight_state == 'LAND':
             if self.hover_pose is not None:
-                msg.pose.position.x    = self.hover_pose.pose.position.x
-                msg.pose.position.y    = self.hover_pose.pose.position.y
-                msg.pose.orientation.x = self.hover_pose.pose.orientation.x
-                msg.pose.orientation.y = self.hover_pose.pose.orientation.y
-                msg.pose.orientation.z = self.hover_pose.pose.orientation.z
-                msg.pose.orientation.w = self.hover_pose.pose.orientation.w
-            if self.land_start_time is not None:
-                elapsed  = (self.get_clock().now()
-                            - self.land_start_time).nanoseconds * 1e-9
-                target_z = self.land_start_alt - self.descent_speed * elapsed
-                msg.pose.position.z = max(target_z, 0.0)
+                p = self.hover_pose.pose.position
+                q = self.hover_pose.pose.orientation
+                _, _, yaw = tf_transformations.euler_from_quaternion(
+                    [q.x, q.y, q.z, q.w])
+                land_z = 0.0
+                if self.land_start_time is not None:
+                    elapsed = (now - self.land_start_time).nanoseconds * 1e-9
+                    land_z  = max(self.land_start_alt - self.descent_speed * elapsed,
+                                  0.0)
+                pos = np.array([p.x, p.y, land_z])
             else:
-                msg.pose.position.z = 0.0
+                pos, yaw = self._default_pos_yaw()
+                pos[2] = 0.0
 
         elif self.flight_state == 'ABORT':
             self._broadcast_state()
             return
 
+        if pos is None:
+            pos, yaw = self._default_pos_yaw()
+
+        msg = PositionTarget()
+        msg.header.stamp     = stamp
+        msg.header.frame_id  = 'map'
+        msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        msg.position.x = float(pos[0])
+        msg.position.y = float(pos[1])
+        msg.position.z = float(pos[2])
+        msg.yaw        = float(yaw)
+
+        if vel is not None:
+            msg.type_mask  = MASK_POS_VEL_YAW
+            msg.velocity.x = float(vel[0])
+            msg.velocity.y = float(vel[1])
+            msg.velocity.z = float(vel[2])
+        else:
+            msg.type_mask = MASK_POS_YAW
+
         self.setpoint_pub.publish(msg)
         self._broadcast_state()
 
-    def _fill_default_setpoint(self, msg):
-        """Fall back to current pose or default altitude."""
+    def _default_pos_yaw(self):
+        """Return (pos np.array [x,y,z], yaw float) from hover_pose or active pose."""
+        if self.hover_pose is not None:
+            p = self.hover_pose.pose.position
+            q = self.hover_pose.pose.orientation
+            _, _, yaw = tf_transformations.euler_from_quaternion(
+                [q.x, q.y, q.z, q.w])
+            return np.array([p.x, p.y, p.z]), yaw
         pose = self._get_active_pose()
         if pose is not None:
-            msg.pose = pose.pose
-        else:
-            msg.pose.position.z    = self.takeoff_altitude
-            msg.pose.orientation.w = 1.0
+            p = pose.pose.position
+            q = pose.pose.orientation
+            _, _, yaw = tf_transformations.euler_from_quaternion(
+                [q.x, q.y, q.z, q.w])
+            return np.array([p.x, p.y, p.z]), yaw
+        return np.array([0.0, 0.0, self.takeoff_altitude]), 0.0
 
     def _broadcast_state(self):
         msg      = String()
@@ -775,8 +825,10 @@ class FollowerNode(Node):
             response.message = f'Cannot follow: state={self.flight_state}'
             return response
 
+        self._follow_yaw = self._get_current_yaw()
         self.flight_state = 'FOLLOW'
-        self.get_logger().info('FOLLOW -- tracking target')
+        self.get_logger().info(
+            f'FOLLOW -- tracking target  locked_yaw={np.degrees(self._follow_yaw):.1f}deg')
         response.success = True
         response.message = 'Following active'
         return response
