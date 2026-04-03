@@ -64,10 +64,10 @@ class FollowerNode(Node):
         self.declare_parameter('vicon_timeout',         0.5)      # s
         self.declare_parameter('vicon_yaw_offset',      0.0)      # rad
         self.declare_parameter('t265_z_offset',         0.0)      # m
-        self.declare_parameter('hover_timeout',         3.0)      # s -> auto-land
+        self.declare_parameter('hover_timeout',         20.0)      # s -> auto-land
         self.declare_parameter('max_follow_speed',      2.5)      # m/s rate limit
         self.declare_parameter('coast_duration',         2.0)      # s to coast before hovering
-        self.declare_parameter('pid_kp',                0.8)      # velocity PID proportional gain
+        self.declare_parameter('pid_kp',                1.5)      # velocity PID proportional gain
         self.declare_parameter('pid_ki',                0.05)     # velocity PID integral gain
         self.declare_parameter('pid_kd',                0.25)      # velocity PID derivative gain
         self.declare_parameter('pid_i_max',             0.5)      # integral windup clamp (m/s equiv)
@@ -138,11 +138,7 @@ class FollowerNode(Node):
         self.tracking_offset    = None       # latest PointStamped from tracker
         self.tracking_status    = 'LOST'
         self.coast_start_time   = None       # when COAST was entered
-        self.coast_velocity     = None       # np.array([vx, vy]) target world velocity at coast entry
-        self.coast_origin       = None       # np.array([x, y, z]) position at coast entry
-        self._prev_target_pos   = None       # previous target world-frame XY for velocity estimation
-        self._prev_target_stamp = None       # timestamp of previous target
-        self._target_velocity   = np.zeros(2)  # EMA-smoothed target velocity (m/s)
+        self.coast_target       = None       # PoseStamped: synthetic target 2m ahead
         self.hover_start_time   = None       # when HOVER was entered
         self.follow_target      = None       # PoseStamped in world frame
         self.last_good_target   = None       # last valid target for HOVER hold
@@ -535,25 +531,8 @@ class FollowerNode(Node):
 
                     self._follow_velocity[:2] = vel_xy
                     self._follow_velocity[2]  = 0.0  # Z handled by position setpoint
-
                     self._pid_prev_error = error
                     self._pid_prev_time  = now
-
-                # Track target's world-frame velocity for coasting
-                if self._prev_target_pos is not None and self._prev_target_stamp is not None:
-                    dt_tgt = (now - self._prev_target_stamp).nanoseconds * 1e-9
-                    if 0.01 < dt_tgt < 1.0:
-                        raw_vel = (tp[:2] - self._prev_target_pos) / dt_tgt
-                        # EMA smooth (alpha=0.5) to reduce noise
-                        self._target_velocity = 0.5 * raw_vel + 0.5 * self._target_velocity
-                self._prev_target_pos = tp[:2].copy()
-                self._prev_target_stamp = now
-                # Normalize to constant 1.0 m/s in target's direction
-                speed = np.linalg.norm(self._target_velocity)
-                if speed > 0.1:
-                    self.coast_velocity = self._target_velocity / speed * 1.0
-                else:
-                    self.coast_velocity = np.zeros(2)
 
                 self.follow_target    = target
                 self.last_good_target = target
@@ -571,22 +550,55 @@ class FollowerNode(Node):
                 yaw = self._follow_yaw if self._follow_yaw is not None else self._get_current_yaw()
 
         elif self.flight_state == 'COAST':
-            if self.coast_origin is not None and self.coast_velocity is not None:
-                elapsed = (now - self.coast_start_time).nanoseconds * 1e-9
-                extrap  = self.coast_origin[:2] + self.coast_velocity * elapsed
-                pos = np.array([float(extrap[0]), float(extrap[1]),
-                                float(self.coast_origin[2])])
-                vel = np.array([float(self.coast_velocity[0]),
-                                float(self.coast_velocity[1]), 0.0])
+            # Treat coast_target exactly like a FOLLOW target (PID + rate limit)
+            if self.coast_target is not None:
+                ct = self.coast_target
+                cur_pos = self._get_current_position()
+                if cur_pos is not None:
+                    dx = ct.pose.position.x - cur_pos[0]
+                    dy = ct.pose.position.y - cur_pos[1]
+                    dist = np.sqrt(dx*dx + dy*dy)
+                    max_step = self.max_follow_speed / self.setpoint_rate
+                    if dist > max_step:
+                        scale = max_step / dist
+                        px = cur_pos[0] + dx * scale
+                        py = cur_pos[1] + dy * scale
+                    else:
+                        px = ct.pose.position.x
+                        py = ct.pose.position.y
+
+                    tp = np.array([px, py, ct.pose.position.z])
+                    error = tp[:2] - cur_pos[:2]
+
+                    p_term = self.pid_kp * error
+                    d_term = np.zeros(2)
+                    if (self._pid_prev_error is not None
+                            and self._pid_prev_time is not None):
+                        dt_pid = (now - self._pid_prev_time).nanoseconds * 1e-9
+                        if 0.01 < dt_pid < 0.5:
+                            d_term = self.pid_kd * (error - self._pid_prev_error) / dt_pid
+                    i_term = self.pid_ki * self._pid_integral
+                    vel_xy = p_term + i_term + d_term
+                    spd = np.linalg.norm(vel_xy)
+                    if spd > self.max_follow_speed:
+                        vel_xy *= self.max_follow_speed / spd
+
+                    self._pid_prev_error = error
+                    self._pid_prev_time  = now
+
+                    pos = tp
+                    vel = np.array([float(vel_xy[0]), float(vel_xy[1]), 0.0])
+                else:
+                    pos = np.array([ct.pose.position.x, ct.pose.position.y,
+                                    ct.pose.position.z])
+                q = ct.pose.orientation
+                _, _, yaw = tf_transformations.euler_from_quaternion(
+                    [q.x, q.y, q.z, q.w])
             elif self.last_good_target is not None:
                 p = self.last_good_target.pose.position
                 pos = np.array([p.x, p.y, p.z])
             else:
                 pos, yaw = self._default_pos_yaw()
-            if self.last_good_target is not None:
-                q = self.last_good_target.pose.orientation
-                _, _, yaw = tf_transformations.euler_from_quaternion(
-                    [q.x, q.y, q.z, q.w])
 
         elif self.flight_state == 'HOVER':
             if self.last_good_target is not None:
@@ -750,16 +762,32 @@ class FollowerNode(Node):
     def _tick_follow(self):
         """Monitor tracking status during FOLLOW."""
         if self.tracking_status == 'LOST' and self.last_good_target is not None:
-            # Lost tracking — coast along velocity vector before hovering.
+            # Lost tracking — place a synthetic target 2m ahead in the
+            # direction from drone to last known target, then fly toward
+            # it using the same FOLLOW control path.
             drone_pos = self._get_current_position()
+            p = self.last_good_target.pose.position
+            target_pos = np.array([p.x, p.y])
             if drone_pos is not None:
-                self.coast_origin = drone_pos
+                direction = target_pos - drone_pos[:2]
+                dist = np.linalg.norm(direction)
+                if dist > 0.05:
+                    direction /= dist
+                else:
+                    direction = np.zeros(2)
+                coast_xy = drone_pos[:2] + direction * 2.0
+                self.coast_target = PoseStamped()
+                self.coast_target.pose.position.x = float(coast_xy[0])
+                self.coast_target.pose.position.y = float(coast_xy[1])
+                self.coast_target.pose.position.z = p.z
+                self.coast_target.pose.orientation = self.last_good_target.pose.orientation
             else:
-                p = self.last_good_target.pose.position
-                self.coast_origin = np.array([p.x, p.y, p.z])
-            speed = np.linalg.norm(self.coast_velocity) if self.coast_velocity is not None else 0.0
+                self.coast_target = self.last_good_target
+
             self.get_logger().info(
-                f'Tracking lost -- coasting at {speed:.2f} m/s')
+                f'Tracking lost -- coasting 2m toward '
+                f'({self.coast_target.pose.position.x:.2f}, '
+                f'{self.coast_target.pose.position.y:.2f})')
             self.flight_state = 'COAST'
             self.coast_start_time = self.get_clock().now()
 
@@ -775,15 +803,15 @@ class FollowerNode(Node):
         elapsed = (self.get_clock().now()
                    - self.coast_start_time).nanoseconds * 1e-9
         if elapsed >= self.coast_duration:
-            # Hover at the extrapolated position (where the drone ends up)
+            # Hover at wherever the drone currently is
             hover = PoseStamped()
-            if self.coast_origin is not None and self.coast_velocity is not None:
-                extrap = self.coast_origin[:2] + self.coast_velocity * elapsed
-                hover.pose.position.x = float(extrap[0])
-                hover.pose.position.y = float(extrap[1])
-                hover.pose.position.z = float(self.coast_origin[2])
-            elif self.last_good_target is not None:
-                hover.pose = self.last_good_target.pose
+            cur_pos = self._get_current_position()
+            if cur_pos is not None:
+                hover.pose.position.x = float(cur_pos[0])
+                hover.pose.position.y = float(cur_pos[1])
+                hover.pose.position.z = float(cur_pos[2])
+            elif self.coast_target is not None:
+                hover.pose.position = self.coast_target.pose.position
             if self.last_good_target is not None:
                 hover.pose.orientation = self.last_good_target.pose.orientation
             else:
@@ -808,6 +836,7 @@ class FollowerNode(Node):
         if self.hover_start_time is not None:
             elapsed = (self.get_clock().now()
                        - self.hover_start_time).nanoseconds * 1e-9
+            self.get_logger().warn(f'Hover time: {elapsed:.2f}s')
             if elapsed > self.hover_timeout:
                 self.get_logger().warn(
                     f'Tracking lost for {elapsed:.1f}s -- auto-landing')
@@ -834,11 +863,7 @@ class FollowerNode(Node):
         self.follow_target           = None
         self.last_good_target        = None
         self.coast_start_time        = None
-        self.coast_velocity          = None
-        self.coast_origin            = None
-        self._prev_target_pos        = None
-        self._prev_target_stamp      = None
-        self._target_velocity        = np.zeros(2)
+        self.coast_target            = None
         self.hover_start_time        = None
         self.t265_z_auto_offset      = None
         self.t265_z_auto_offset_done = False

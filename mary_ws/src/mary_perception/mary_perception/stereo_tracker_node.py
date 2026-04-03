@@ -217,6 +217,10 @@ class StereoTrackerNode(Node):
             self.pub_debug = self.create_publisher(
                 Image, '/mary/tracking/debug', 10)
 
+        # Republish raw fisheye with RELIABLE QoS so rqt_image_view can display it
+        self.pub_fisheye_raw = self.create_publisher(
+            Image, '/mary/camera/fisheye_raw', 10)
+
         # -- Subscribers for debug overlay ------------------------------------
         self.create_subscription(
             String, '/mary/comm/flight_state',
@@ -347,6 +351,9 @@ class StereoTrackerNode(Node):
     def _stereo_cb(self, left_msg, right_msg):
         if not self.calibrated:
             return
+
+        # Republish raw fisheye with RELIABLE QoS for rqt viewing
+        self.pub_fisheye_raw.publish(left_msg)
 
         left  = self.bridge.imgmsg_to_cv2(left_msg,  desired_encoding='mono8')
         right = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='mono8')
